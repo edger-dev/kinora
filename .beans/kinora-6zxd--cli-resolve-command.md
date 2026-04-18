@@ -1,11 +1,11 @@
 ---
 # kinora-6zxd
 title: 'CLI: resolve command'
-status: todo
+status: in-progress
 type: feature
 priority: normal
 created_at: 2026-04-18T09:16:59Z
-updated_at: 2026-04-18T14:23:45Z
+updated_at: 2026-04-18T16:15:19Z
 parent: kinora-w7w0
 blocked_by:
     - kinora-5k13
@@ -60,3 +60,32 @@ Reconcile via one of:
 - [ ] `--version HASH` returns specific prior version's content
 - [ ] `--all-heads` flag returns all heads without erroring
 - [ ] Unknown name/id yields clear error
+
+## Plan
+
+Library-first again — resolution logic belongs in `kinora` so it's reusable (kinograph-zboo needs the same name→id resolution on store).
+
+**`crates/kinora/src/resolve.rs` (new):**
+
+- `Identity { id, events, heads, lineages }` — all events for a single id, with heads computed as leaves of the within-identity version DAG.
+- `Resolver` — loads all identities up-front from `Ledger::read_all_lineages`. Methods:
+  - `resolve_by_id(id) -> Result<Resolved, ResolveError>` — exact 64-hex match; errors on unknown.
+  - `resolve_by_name(name) -> Result<Resolved, ResolveError>` — scan metadata["name"] across latest version of each identity; errors on 0 or >1 hit.
+  - `resolve_at_version(id, hash) -> Result<Resolved, ResolveError>` — specific version lookup.
+- `Resolved { id, head: Event, content: Vec<u8>, lineage, all_heads }` — returns the chosen head plus content bytes (read + hash-verified via ContentStore).
+- `ResolveError` variants: NotFound, AmbiguousName { name, ids }, MultipleHeads { id, heads, lineages }, Store/Ledger/Hash parse wrapping.
+
+Branch-aware resolution: if multiple heads but HEAD-lineage contains exactly one of them, prefer that head. Otherwise surface MultipleHeads.
+
+**CLI (`crates/kinora-cli/src/`):**
+
+- Add `Command::Resolve` to cli.rs (positional `name_or_id`, optional `--version HASH`, `--all-heads` flag).
+- `resolve.rs` — format output:
+  - success: write content to stdout
+  - fork: pretty-print actionable report matching the bean spec (heads with timestamps, suggested reconcile commands)
+- Wire into main.rs dispatch.
+
+Commit plan:
+1. resolve library + tests
+2. resolve CLI + tests
+3. review fixes if any

@@ -7,6 +7,7 @@ pub mod kino;
 pub mod ledger;
 pub mod namespace;
 pub mod paths;
+pub mod resolve;
 pub mod store;
 pub mod validate;
 pub mod value;
