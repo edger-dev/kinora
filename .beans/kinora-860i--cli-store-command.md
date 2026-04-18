@@ -1,11 +1,11 @@
 ---
 # kinora-860i
 title: 'CLI: store command'
-status: in-progress
+status: completed
 type: feature
 priority: normal
 created_at: 2026-04-18T09:16:59Z
-updated_at: 2026-04-18T16:09:00Z
+updated_at: 2026-04-18T16:14:31Z
 parent: kinora-w7w0
 blocked_by:
     - kinora-5k13
@@ -86,3 +86,36 @@ Commit plan:
 ## Progress
 
 - [x] Library: `author::resolve_author_from_git` + `kino::store_kino` orchestrator.
+
+## Summary of Changes
+
+Wired `kinora store` end-to-end on top of the kinora-5k13 data layer.
+
+**Library (`crates/kinora/src/`)**
+
+- `author.rs` — `resolve_author_from_git(repo_root)` reads `user.name` from the repo's merged git config via gix; returns None for non-git dirs or when unset. Used as a default when `--author` is omitted.
+- `kino.rs` — `store_kino()` orchestrates: write blob (dedup via ContentStore), decide birth vs version (birth = no id + no parents; `--parents` without `--id` is rejected with `ParentsWithoutId`), build the Event envelope, run `validate_event_shape` + `validate_parents_exist`, then mint or append to the ledger based on HEAD presence.
+
+**CLI (`crates/kinora-cli/src/`)**
+
+- `cli.rs` — figue-derived `Cli` + `Command::Store` with all spec flags (positional `kind` + `path`, required `--provenance`, optional `--name` / `--id` / `--parents` / `--author`, `--draft` switch, repeatable `-m key=value`). Flattens `FigueBuiltins` so `--help`, `--version`, and `--completions` just work.
+- `common.rs` — walks up from cwd to find `.kinora/`, parses `KEY=VALUE` (trimmed key; empty key rejected; values may contain `=`), splits comma-delimited parents.
+- `store.rs` — pure `StoreRunArgs → StoredKino` runner: reads content from file or stdin, assembles metadata (name, draft flag, repeatable -m), resolves author (flag > git user.name), stamps with jiff, dispatches to `store_kino`. Rejects `--draft` + `-m draft=X` collisions with `ConflictingDraftFlag` rather than letting flag order decide silently.
+- `main.rs` — `figue::from_std_args → .into_result() → .get()`; exits 0 for help/version/completions via `DriverError::is_success()`, 1 for parse errors or runtime failures, printing `stored kind=… id=… hash=… lineage=…` on success.
+
+**Design decisions documented inline**
+
+- MVP lineage model: one lineage per repo. HEAD-absent mints, HEAD-present appends. Per-branch and per-identity lineage partitioning is deferred — identity lives in `event.id`, not the lineage filename. Noted in `kino.rs`.
+- A CLI `init` subcommand is not in this task; library-level `init()` is complete. Follow-up bean will wire it into the CLI.
+
+**Test coverage**
+
+113 workspace tests (94 library + 19 CLI). Library tests cover birth, version, missing-parent rejection, unknown kind/metadata rejection, dedupe (no blob rewrite), and missing-.kinora. CLI tests cover file+stdin paths, draft→metadata, -m parsing, key trimming, invalid metadata rejection, draft-collision rejection, no-kinora error, author-unresolved, and version-event flow. Zero compiler warnings.
+
+**Smoke-tested end-to-end** against a hand-laid-out `.kinora/`: birth→new lineage, second birth→append, version event with `--id`/`--parents`, `-m tags=a,b` metadata, stdin content, `--help` rendering.
+
+**Follow-ups (separate beans)**
+
+- Wire `kinora init` into the CLI.
+- Branch-aware lineage minting (`git rev-parse` integration).
+- Optional: warn when `--parents` contains stray empty entries (`,,abc`).
