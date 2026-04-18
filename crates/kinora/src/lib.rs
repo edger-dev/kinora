@@ -9,6 +9,7 @@ pub mod kinograph;
 pub mod ledger;
 pub mod namespace;
 pub mod paths;
+pub mod render;
 pub mod resolve;
 pub mod store;
 pub mod validate;

@@ -5,7 +5,7 @@ status: in-progress
 type: feature
 priority: normal
 created_at: 2026-04-18T09:16:59Z
-updated_at: 2026-04-18T16:43:56Z
+updated_at: 2026-04-18T16:47:15Z
 parent: kinora-w7w0
 blocked_by:
     - kinora-zboo
@@ -65,8 +65,8 @@ RFC-0003 sections: *Rendering*, *Minimal CLI → render*. Design decisions in `k
 - [x] Derives cache path correctly per normalization rules
 - [ ] Renders single current branch end-to-end
 - [ ] Extends to all local branches and worktrees (union of ledger files per branch)
-- [ ] Kind dispatch: `markdown` + `kinograph` in MVP
-- [ ] `kino://<id>/` URLs resolved to cross-links between rendered pages
+- [x] Kind dispatch: `markdown` + `kinograph` in MVP
+- [x] `kino://<id>/` URLs resolved to cross-links between rendered pages
 - [ ] SUMMARY.md organized by branch
 - [ ] Source markers include originating branch
 - [ ] Full rebuild on every run
