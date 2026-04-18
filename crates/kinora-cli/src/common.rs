@@ -10,6 +10,7 @@ pub enum CliError {
     Io(io::Error),
     NotInKinoraRepo { start: PathBuf },
     InvalidMetadataFlag { got: String },
+    ConflictingDraftFlag,
     AuthorUnresolved,
     StoreKino(StoreKinoError),
 }
@@ -26,6 +27,10 @@ impl fmt::Display for CliError {
             CliError::InvalidMetadataFlag { got } => write!(
                 f,
                 "--metadata expects KEY=VALUE, got `{got}`"
+            ),
+            CliError::ConflictingDraftFlag => write!(
+                f,
+                "--draft conflicts with `-m draft=…`; pass only one"
             ),
             CliError::AuthorUnresolved => write!(
                 f,
@@ -65,12 +70,20 @@ pub fn find_repo_root(start: &Path) -> Result<PathBuf, CliError> {
     }
 }
 
-/// Parse a single `KEY=VALUE` string. Empty keys are rejected; the value
-/// may be empty (explicit empty string). The value may contain `=`.
+/// Parse a single `KEY=VALUE` string. The key is trimmed; empty keys
+/// are rejected. The value may be empty (explicit empty string) and may
+/// contain `=` (split on the first `=` only).
 pub fn parse_metadata_flag(s: &str) -> Result<(String, String), CliError> {
     match s.split_once('=') {
-        Some((k, v)) if !k.is_empty() => Ok((k.to_owned(), v.to_owned())),
-        _ => Err(CliError::InvalidMetadataFlag { got: s.to_owned() }),
+        Some((k, v)) => {
+            let k = k.trim();
+            if k.is_empty() {
+                Err(CliError::InvalidMetadataFlag { got: s.to_owned() })
+            } else {
+                Ok((k.to_owned(), v.to_owned()))
+            }
+        }
+        None => Err(CliError::InvalidMetadataFlag { got: s.to_owned() }),
     }
 }
 

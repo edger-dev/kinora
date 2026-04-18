@@ -15,6 +15,7 @@ pub enum StoreKinoError {
     Event(EventError),
     Validation(ValidationError),
     KinoraMissing { path: PathBuf },
+    ParentsWithoutId,
 }
 
 impl std::fmt::Display for StoreKinoError {
@@ -28,6 +29,10 @@ impl std::fmt::Display for StoreKinoError {
             StoreKinoError::KinoraMissing { path } => {
                 write!(f, ".kinora/ not found at {}; run `kinora init` first", path.display())
             }
+            StoreKinoError::ParentsWithoutId => write!(
+                f,
+                "--parents requires --id: cannot infer identity from parents without walking the ledger DAG"
+            ),
         }
     }
 }
@@ -114,9 +119,7 @@ pub fn store_kino(
                 // Version event without explicit id — disallow: we can't infer
                 // identity from parents without walking the ledger DAG, and
                 // mistakenly birthing-from-parents would silently detach.
-                return Err(StoreKinoError::Validation(
-                    ValidationError::VersionEventIdMustDiffer,
-                ));
+                return Err(StoreKinoError::ParentsWithoutId);
             }
             hash_hex.clone()
         }
@@ -136,6 +139,10 @@ pub fn store_kino(
     validate::validate_event_shape(&event)?;
     validate::validate_parents_exist(&store, &event)?;
 
+    // MVP: one lineage per repo. HEAD-absent mints; HEAD-present appends.
+    // Per kinora-5k13 design, per-branch (or per-identity) lineage
+    // partitioning is deferred — multiple identities can coexist in one
+    // lineage for now; identity lives in `event.id`, not the filename.
     let was_new_lineage = ledger.current_lineage()?.is_none();
     let lineage = if was_new_lineage {
         ledger.mint_and_append(&event)?
@@ -235,7 +242,7 @@ mod tests {
         let mut p = params("markdown", b"v2");
         p.parents = vec![birth.event.hash.clone()];
         let err = store_kino(&root, p).unwrap_err();
-        assert!(matches!(err, StoreKinoError::Validation(_)));
+        assert!(matches!(err, StoreKinoError::ParentsWithoutId));
     }
 
     #[test]

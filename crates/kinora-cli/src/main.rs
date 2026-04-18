@@ -12,7 +12,9 @@ fn main() -> ExitCode {
         Ok(output) => output.get(),
         Err(e) => {
             eprintln!("{e}");
-            return if e.is_help() { ExitCode::SUCCESS } else { ExitCode::FAILURE };
+            // DriverError classifies help, --version, and --completions as
+            // success exits (exit_code == 0).
+            return if e.is_success() { ExitCode::SUCCESS } else { ExitCode::FAILURE };
         }
     };
 

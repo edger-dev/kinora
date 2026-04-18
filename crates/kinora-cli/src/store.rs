@@ -33,12 +33,15 @@ pub fn run_store(cwd: &Path, args: StoreRunArgs) -> Result<StoredKino, CliError>
     if let Some(name) = args.name {
         metadata.insert("name".into(), name);
     }
-    if args.draft {
-        metadata.insert("draft".into(), "true".into());
-    }
     for kv in &args.metadata {
         let (k, v) = parse_metadata_flag(kv)?;
+        if k == "draft" && args.draft {
+            return Err(CliError::ConflictingDraftFlag);
+        }
         metadata.insert(k, v);
+    }
+    if args.draft {
+        metadata.insert("draft".into(), "true".into());
     }
 
     let parents = parse_parents(args.parents.as_deref());
@@ -86,7 +89,8 @@ mod tests {
     fn repo() -> TempDir {
         let tmp = TempDir::new().unwrap();
         init(tmp.path(), "https://example.com/x.git").unwrap();
-        // Pre-set an author so tests don't depend on host git config.
+        // Tests pass `author: Some("YJ")` in base_args so they don't depend
+        // on the host's git config.
         tmp
     }
 
@@ -180,6 +184,31 @@ mod tests {
         args.author = None;
         let err = run_store(tmp.path(), args).unwrap_err();
         assert!(matches!(err, CliError::AuthorUnresolved));
+    }
+
+    #[test]
+    fn draft_flag_conflicts_with_metadata_draft_value() {
+        let tmp = repo();
+        let src = tmp.path().join("x.md");
+        fs::write(&src, b"x").unwrap();
+
+        let mut args = base_args("markdown", src.to_str().unwrap());
+        args.draft = true;
+        args.metadata = vec!["draft=false".into()];
+        let err = run_store(tmp.path(), args).unwrap_err();
+        assert!(matches!(err, CliError::ConflictingDraftFlag));
+    }
+
+    #[test]
+    fn metadata_flag_trims_whitespace_around_key() {
+        let tmp = repo();
+        let src = tmp.path().join("x.md");
+        fs::write(&src, b"x").unwrap();
+
+        let mut args = base_args("markdown", src.to_str().unwrap());
+        args.metadata = vec!["  title  =Hello".into()];
+        let stored = run_store(tmp.path(), args).unwrap();
+        assert_eq!(stored.event.metadata.get("title").unwrap(), "Hello");
     }
 
     #[test]
