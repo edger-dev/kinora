@@ -1,11 +1,11 @@
 ---
 # kinora-9nom
 title: 'CLI: render command (mdbook)'
-status: in-progress
+status: completed
 type: feature
 priority: normal
 created_at: 2026-04-18T09:16:59Z
-updated_at: 2026-04-18T16:54:14Z
+updated_at: 2026-04-18T17:03:00Z
 parent: kinora-w7w0
 blocked_by:
     - kinora-zboo
@@ -121,3 +121,18 @@ Multi-branch = walking `gix` tree objects for each local ref to read `.kinora/le
 3. disk writer + tests
 4. CLI `render` command + end-to-end tests
 5. review fixes if any
+
+## Summary of Changes
+
+Shipped library-first across four layers with zero warnings and 197 tests passing.
+
+**`crates/kinora/src/cache_path.rs`** — pure `CachePath::from_repo_url()` that normalizes URLs (strip scheme/userinfo/`.git`, SSH `host:path` → `host/path`, lowercase host, preserve path case) and derives `<shorthash>-<name>`. Transport-agnostic: `https://` and `git@` forms collide as intended. Uses `strip_suffix(".git")` so `foo.git.git` ≠ `foo.git`.
+
+**`crates/kinora/src/render.rs` (in-memory)** — `Book { pages, skipped }` with `render_for_branch(resolver, branch)`. Kind dispatch: markdown passthrough, kinograph via `Kinograph::render`, text fenced, binary placeholder, other kinds get an "unrenderable kind" placeholder. Forked identities (`ResolveError::MultipleHeads`) are collected into `Book.skipped` rather than failing the whole render. `kino://<64hex>/` URL rewriting uses `str::find` + `is_char_boundary` + `Hash::from_str` validation for UTF-8-safe rewrites to relative page paths. Slugs are `<sanitized-name>-<shorthash>` with `-N` disambiguation.
+
+**`crates/kinora/src/render.rs` (disk writer)** — `write_book()` wipes `src/`, emits `book.toml` with escaped title (handles `\`, `"`, `
+`, `\r`, control chars), `src/SUMMARY.md` grouped by branch, per-branch `index.md`, and per-page files with a `*From branch <branch>*` source marker footer. Layout uses per-branch directories even in single-branch mode so multi-branch is additive.
+
+**`crates/kinora-cli/src/render.rs`** — `kinora render [--cache-dir <path>]` reads `.kinora/config.styx → repo-url`, resolves cache root (XDG_CACHE_HOME → HOME/.cache fallback), runs `render_for_branch` on current lineage, writes to `<cache>/<shorthash>-<name>/`. Pure `resolve_cache_root(xdg, home)` helper factored out for unit testing without touching process env (workspace forbids `unsafe`, blocking `std::env::set_var`). Prints `rendered N pages [(skipped K forked)] into <path>`. Smoke-tested end-to-end with `mdbook build` producing clean HTML.
+
+**Deferred:** multi-branch + worktree enumeration → kinora-ohwb. Library signatures already absorb `Vec<(branch, Resolver)>` cleanly, so that work is purely additive.
