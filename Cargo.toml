@@ -1,8 +1,12 @@
 [workspace]
 resolver = "2"
-members = []
+members = [
+    "crates/kinora",
+    "crates/kinora-cli",
+]
 
 [workspace.package]
+version = "0.0.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/edger-dev/kinora"
