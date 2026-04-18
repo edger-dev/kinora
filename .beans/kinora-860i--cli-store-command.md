@@ -1,11 +1,11 @@
 ---
 # kinora-860i
 title: 'CLI: store command'
-status: todo
+status: in-progress
 type: feature
 priority: normal
 created_at: 2026-04-18T09:16:59Z
-updated_at: 2026-04-18T14:23:45Z
+updated_at: 2026-04-18T16:03:56Z
 parent: kinora-w7w0
 blocked_by:
     - kinora-5k13
@@ -61,3 +61,28 @@ kinora store <kind> [path] \
 - [ ] Appends to current lineage file when lineage exists
 - [ ] Updates `.kinora/HEAD` when minting new lineage
 - [ ] After running, workspace ready for `git add` + `git commit`
+
+## Plan
+
+Library-first. Put orchestration in `kinora` so it's unit-testable; CLI is a thin wrapper.
+
+**`crates/kinora/src/`:**
+- `author.rs` — `resolve_author_from_git(repo_root)` via gix → reads user.name from merged git config. Falls back to None.
+- `kino.rs` — `StoreKinoParams` + `store_kino(kinora_root, params)` orchestrates: write blob (dedup), resolve id/parents (birth vs version), build Event, validate shape + parent-presence, mint or append to ledger. Returns `StoredKino { event, lineage, was_new_lineage }`.
+
+**`crates/kinora-cli/src/`:**
+- `cli.rs` — figue CLI struct with `store` subcommand (positional kind + optional path; flags --name/--id/--parents/--draft/--provenance/--author/--metadata/-m).
+- `common.rs` — walk up from cwd to find `.kinora/`; error if not found.
+- `store.rs` — read content from file|stdin, parse metadata k=v, parse comma-split parents, build params, resolve author, call library, print `kind id hash lineage`.
+- `main.rs` — argv parse via `figue::from_std_args()`, dispatch on subcommand.
+
+**Scope cuts:** 'first-store-on-new-branch mints new lineage' reduces to 'HEAD absent ⇒ mint, else append'. Branch-aware minting is post-MVP. Kinograph name→id resolution lives in kinora-zboo, not here — store just writes whatever bytes it receives.
+
+Commit plan:
+1. author + kino modules with tests
+2. CLI wiring + integration test
+3. Review fixes if any
+
+## Progress
+
+- [x] Library: `author::resolve_author_from_git` + `kino::store_kino` orchestrator.

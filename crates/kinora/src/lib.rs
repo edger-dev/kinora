@@ -1,7 +1,9 @@
+pub mod author;
 pub mod config;
 pub mod event;
 pub mod hash;
 pub mod init;
+pub mod kino;
 pub mod ledger;
 pub mod namespace;
 pub mod paths;
