@@ -1,0 +1,21 @@
+[jobs.check]
+command = ["cargo", "check", "--workspace"]
+default_job = true
+
+[jobs.clippy]
+command = ["cargo", "clippy", "--workspace", "--", "--deny", "warnings"]
+
+[jobs.test]
+command = ["cargo", "test", "--workspace"]
+need_stdout = true
+
+[jobs.claude-diagnostics]
+command = ["cargo", "clippy", "--all-targets", "--message-format", "json-diagnostic-rendered-ansi"]
+analyzer = "cargo_json"
+need_stdout = true
+
+[exports.cargo-json-spans]
+auto = true
+exporter = "analyser"
+line_format = "{diagnostic.level}|:|{span.file_name}|:|{span.line_start}|:|{span.line_end}|:|{diagnostic.message}|:|{diagnostic.rendered}"
+path = ".bacon-claude-diagnostics"

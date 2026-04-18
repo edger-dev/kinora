@@ -1,0 +1,23 @@
+# Base tasks (from jig)
+
+[tasks.jig-update]
+run = "nix flake update jig"
+description = "Update jig to latest from github"
+
+[tasks.jig-update-local]
+run = "nix flake update --override-input jig path:$HOME/edger/jig"
+description = "Override jig with local checkout (for development)"
+
+# Rust workspace tasks (from jig)
+
+[tasks.check]
+run = "cargo check --workspace"
+description = "Type-check workspace"
+
+[tasks.fmt]
+run = "cargo fmt --all"
+description = "Format all Rust code"
+
+[tasks._bacon-claude-diagnostics]
+run = "bacon claude-diagnostics"
+description = "⭐ Run bacon background checker (exports diagnostics to .bacon-claude-diagnostics)"
