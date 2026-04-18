@@ -14,7 +14,10 @@
 //! `kino://<64hex-id>[/]` occurrences in the body are rewritten to relative
 //! links to the target page. Unknown ids are left unchanged.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::fs;
+use std::io;
+use std::path::Path;
 use std::str::FromStr;
 
 use crate::hash::{Hash, SHORTHASH_LEN};
@@ -40,6 +43,7 @@ pub struct Book {
 
 #[derive(Debug)]
 pub enum RenderError {
+    Io(io::Error),
     Resolve(ResolveError),
     Kinograph(KinographError),
     Utf8(std::string::FromUtf8Error),
@@ -48,6 +52,7 @@ pub enum RenderError {
 impl std::fmt::Display for RenderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            RenderError::Io(e) => write!(f, "render io error: {e}"),
             RenderError::Resolve(e) => write!(f, "{e}"),
             RenderError::Kinograph(e) => write!(f, "{e}"),
             RenderError::Utf8(e) => write!(f, "kino content is not valid UTF-8: {e}"),
@@ -56,6 +61,12 @@ impl std::fmt::Display for RenderError {
 }
 
 impl std::error::Error for RenderError {}
+
+impl From<io::Error> for RenderError {
+    fn from(e: io::Error) -> Self {
+        RenderError::Io(e)
+    }
+}
 
 impl From<ResolveError> for RenderError {
     fn from(e: ResolveError) -> Self {
@@ -249,6 +260,103 @@ fn rewrite_kino_urls(body: &str, slug_by_id: &HashMap<String, String>) -> String
         rest = after_prefix;
     }
     out.push_str(rest);
+    out
+}
+
+/// Write a `Book` to disk in mdbook's expected shape.
+///
+/// Layout:
+/// ```text
+/// <cache_root>/
+///   book.toml
+///   src/
+///     SUMMARY.md               # grouped by branch
+///     <branch>/
+///       index.md               # per-branch landing page
+///       <slug>.md              # one per rendered page
+/// ```
+///
+/// `src/` is deleted and rebuilt from scratch on every call so stale pages
+/// don't linger. `book.toml` is always rewritten — mdbook's build output
+/// (`book/`) is untouched.
+pub fn write_book(cache_root: &Path, title: &str, book: &Book) -> Result<(), RenderError> {
+    fs::create_dir_all(cache_root)?;
+
+    let src_dir = cache_root.join("src");
+    if src_dir.exists() {
+        fs::remove_dir_all(&src_dir)?;
+    }
+    fs::create_dir_all(&src_dir)?;
+
+    fs::write(cache_root.join("book.toml"), book_toml(title))?;
+
+    let by_branch = group_by_branch(book);
+    for (branch, pages) in &by_branch {
+        let branch_dir = src_dir.join(branch);
+        fs::create_dir_all(&branch_dir)?;
+        fs::write(branch_dir.join("index.md"), branch_index_md(branch, pages))?;
+        for page in pages {
+            let body = page_with_source_marker(page);
+            fs::write(branch_dir.join(format!("{}.md", page.slug)), body)?;
+        }
+    }
+
+    fs::write(src_dir.join("SUMMARY.md"), summary_md(&by_branch))?;
+    Ok(())
+}
+
+fn book_toml(title: &str) -> String {
+    let escaped = title.replace('\\', "\\\\").replace('"', "\\\"");
+    format!(
+        "[book]\ntitle = \"{escaped}\"\nsrc = \"src\"\nauthors = [\"kinora\"]\n\n[output.html]\n",
+    )
+}
+
+fn group_by_branch(book: &Book) -> BTreeMap<String, Vec<&RenderedPage>> {
+    let mut map: BTreeMap<String, Vec<&RenderedPage>> = BTreeMap::new();
+    for page in &book.pages {
+        map.entry(page.branch.clone()).or_default().push(page);
+    }
+    map
+}
+
+fn summary_md(by_branch: &BTreeMap<String, Vec<&RenderedPage>>) -> String {
+    let mut out = String::from("# Summary\n\n");
+    for (branch, pages) in by_branch {
+        out.push_str(&format!("- [{branch}]({branch}/index.md)\n"));
+        for page in pages {
+            out.push_str(&format!(
+                "  - [{}]({}/{}.md)\n",
+                page.title, branch, page.slug,
+            ));
+        }
+    }
+    out
+}
+
+fn branch_index_md(branch: &str, pages: &[&RenderedPage]) -> String {
+    let mut out = format!("# {branch}\n\n");
+    if pages.is_empty() {
+        out.push_str("_(no pages)_\n");
+        return out;
+    }
+    out.push_str("Pages:\n\n");
+    for page in pages {
+        out.push_str(&format!("- [{}]({}.md)\n", page.title, page.slug));
+    }
+    out
+}
+
+fn page_with_source_marker(page: &RenderedPage) -> String {
+    let mut out = page.body.clone();
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "\n---\n\n*Rendered from branch `{}` (id `{}`)*\n",
+        page.branch,
+        short_id(&page.id),
+    ));
     out
 }
 
@@ -451,6 +559,99 @@ mod tests {
         let slugs: std::collections::HashSet<_> =
             book.pages.iter().map(|p| p.slug.as_str()).collect();
         assert_eq!(slugs.len(), book.pages.len(), "slugs collided: {book:?}");
+    }
+
+    #[test]
+    fn write_book_materializes_mdbook_layout() {
+        let (_t, root) = setup();
+        store_kino(&root, params("markdown", b"# Alpha\n", "alpha")).unwrap();
+        store_kino(&root, params("markdown", b"# Beta\n", "beta")).unwrap();
+        let resolver = Resolver::load(&root).unwrap();
+        let book = render_for_branch(&resolver, "main").unwrap();
+
+        let cache = TempDir::new().unwrap();
+        write_book(cache.path(), "My Book", &book).unwrap();
+
+        assert!(cache.path().join("book.toml").is_file());
+        assert!(cache.path().join("src/SUMMARY.md").is_file());
+        assert!(cache.path().join("src/main/index.md").is_file());
+
+        let summary =
+            std::fs::read_to_string(cache.path().join("src/SUMMARY.md")).unwrap();
+        assert!(summary.starts_with("# Summary"));
+        assert!(summary.contains("- [main](main/index.md)"));
+        assert!(summary.contains("main/"));
+        for page in &book.pages {
+            let path = cache.path().join("src/main").join(format!("{}.md", page.slug));
+            assert!(path.is_file(), "missing page: {path:?}");
+            let contents = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                contents.contains("Rendered from branch `main`"),
+                "expected source marker; got: {contents}"
+            );
+        }
+    }
+
+    #[test]
+    fn write_book_rebuilds_src_from_scratch() {
+        let (_t, root) = setup();
+        store_kino(&root, params("markdown", b"v1", "doc")).unwrap();
+        let cache = TempDir::new().unwrap();
+
+        // First render.
+        let resolver = Resolver::load(&root).unwrap();
+        let book = render_for_branch(&resolver, "main").unwrap();
+        write_book(cache.path(), "t", &book).unwrap();
+        let stale_path = cache.path().join("src/main/stale-page.md");
+        std::fs::write(&stale_path, "stale").unwrap();
+        assert!(stale_path.exists());
+
+        // Second render — should wipe stale file.
+        let resolver = Resolver::load(&root).unwrap();
+        let book = render_for_branch(&resolver, "main").unwrap();
+        write_book(cache.path(), "t", &book).unwrap();
+        assert!(!stale_path.exists(), "stale file survived rebuild");
+    }
+
+    #[test]
+    fn book_toml_includes_title_and_src_dir() {
+        let cache = TempDir::new().unwrap();
+        let book = Book::default();
+        write_book(cache.path(), "Kinora Cache", &book).unwrap();
+        let toml = std::fs::read_to_string(cache.path().join("book.toml")).unwrap();
+        assert!(toml.contains("title = \"Kinora Cache\""), "got: {toml}");
+        assert!(toml.contains("src = \"src\""), "got: {toml}");
+    }
+
+    #[test]
+    fn summary_groups_by_branch_in_sorted_order() {
+        let book = Book {
+            pages: vec![
+                RenderedPage {
+                    id: "a".repeat(64),
+                    slug: "alpha-aaaaaaaa".into(),
+                    branch: "zeta".into(),
+                    title: "Alpha".into(),
+                    kind: "markdown".into(),
+                    body: "x".into(),
+                },
+                RenderedPage {
+                    id: "b".repeat(64),
+                    slug: "beta-bbbbbbbb".into(),
+                    branch: "main".into(),
+                    title: "Beta".into(),
+                    kind: "markdown".into(),
+                    body: "y".into(),
+                },
+            ],
+        };
+        let cache = TempDir::new().unwrap();
+        write_book(cache.path(), "t", &book).unwrap();
+        let summary =
+            std::fs::read_to_string(cache.path().join("src/SUMMARY.md")).unwrap();
+        let main_idx = summary.find("[main]").unwrap();
+        let zeta_idx = summary.find("[zeta]").unwrap();
+        assert!(main_idx < zeta_idx, "branches not sorted: {summary}");
     }
 
     #[test]
