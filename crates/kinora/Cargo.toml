@@ -13,6 +13,7 @@ blake3 = { workspace = true }
 facet = { workspace = true }
 facet-json = { workspace = true }
 facet-styx = { workspace = true }
+gix = { workspace = true }
 jiff = { workspace = true }
 
 [dev-dependencies]

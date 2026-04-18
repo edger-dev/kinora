@@ -5,7 +5,7 @@ status: in-progress
 type: feature
 priority: normal
 created_at: 2026-04-18T09:16:59Z
-updated_at: 2026-04-18T15:34:48Z
+updated_at: 2026-04-18T15:37:45Z
 parent: kinora-w7w0
 blocked_by:
     - kinora-fhw1
@@ -90,7 +90,7 @@ RFC-0003 sections: *Repository Layout*, *Content Store*, *Ledger*, *Provenance*.
 - [x] Event envelope enforced: `kind`, `id`, `hash`, `parents[]`, `ts`, `author`, `provenance`, `metadata{}`
 - [x] Namespace rules validated on write (bare reserved, `prefix::` extension)
 - [x] Parent existence checked on append
-- [ ] First-store-on-new-branch mints new lineage file
+- [x] First-store-on-new-branch mints new lineage file (Ledger supports mint/append; branch detection deferred to store command)
 - [x] `.kinora/HEAD` tracks current lineage
 - [x] facet-based serialization for in-memory types
 - [x] Unit tests cover round-trip, lineage creation, append invariants, metadata merge
@@ -112,11 +112,11 @@ Bootstraps `.kinora/` in a repo:
 
 ### Acceptance (init)
 
-- [ ] `kinora init` creates `.kinora/` with `config.styx` (only `repo-url`) + empty `store/` + empty `ledger/`
-- [ ] `--repo-url URL` overrides git remote
-- [ ] Falls back to `git remote get-url origin` via `gix`
-- [ ] Errors clearly if no remote and no flag given
-- [ ] Refuses to overwrite an existing `.kinora/`
+- [x] `kinora init` creates `.kinora/` with `config.styx` (only `repo-url`) + empty `store/` + empty `ledger/`
+- [x] `--repo-url URL` overrides git remote
+- [x] Falls back to `git remote get-url origin` via `gix`
+- [x] Errors clearly if no remote and no flag given
+- [x] Refuses to overwrite an existing `.kinora/`
 
 
 ## Plan

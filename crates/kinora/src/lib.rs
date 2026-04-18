@@ -1,6 +1,7 @@
 pub mod config;
 pub mod event;
 pub mod hash;
+pub mod init;
 pub mod ledger;
 pub mod namespace;
 pub mod paths;
