@@ -48,3 +48,4 @@ figue = "2.0.3"
 
 # Tests
 rstest = "0.26.1"
+tempfile = "3.27.0"
