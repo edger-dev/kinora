@@ -1,0 +1,170 @@
+{
+  "nodes": {
+    "crane": {
+      "locked": {
+        "lastModified": 1775236976,
+        "narHash": "sha256-gCgX+AXN7K1gAIEqcLcZHxmC+QoZcwn9m6Z9r2Az+N8=",
+        "owner": "ipetkov",
+        "repo": "crane",
+        "rev": "6c23998526351a53ce734f0ac84940da988ccef1",
+        "type": "github"
+      },
+      "original": {
+        "owner": "ipetkov",
+        "repo": "crane",
+        "type": "github"
+      }
+    },
+    "fenix": {
+      "inputs": {
+        "nixpkgs": [
+          "jig",
+          "nixpkgs"
+        ],
+        "rust-analyzer-src": "rust-analyzer-src"
+      },
+      "locked": {
+        "lastModified": 1775201252,
+        "narHash": "sha256-CFXf8rcU+NekWtu5fkI8x7QF9uoeJyaiNo/bvKK/lyY=",
+        "owner": "nix-community",
+        "repo": "fenix",
+        "rev": "0b88bfd10f819d000d35d296debe283db89b623b",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nix-community",
+        "repo": "fenix",
+        "type": "github"
+      }
+    },
+    "flake-utils": {
+      "inputs": {
+        "systems": "systems"
+      },
+      "locked": {
+        "lastModified": 1731533236,
+        "narHash": "sha256-l0KFg5HjrsfsO/JpG+r7fRrqm12kzFHyUHqHCVpMMbI=",
+        "owner": "numtide",
+        "repo": "flake-utils",
+        "rev": "11707dc2f618dd54ca8739b309ec4fc024de578b",
+        "type": "github"
+      },
+      "original": {
+        "owner": "numtide",
+        "repo": "flake-utils",
+        "type": "github"
+      }
+    },
+    "jig": {
+      "inputs": {
+        "crane": "crane",
+        "fenix": "fenix",
+        "flake-utils": "flake-utils",
+        "mdbook-beans": "mdbook-beans",
+        "nixpkgs": "nixpkgs"
+      },
+      "locked": {
+        "lastModified": 1775374396,
+        "narHash": "sha256-nupJCDwaSrJBU1td5+xOwQP1BFE99v/hgxLt4CR4TnE=",
+        "owner": "edger-dev",
+        "repo": "jig",
+        "rev": "1f1b27c64e46b550b6ed59b9c5d913c0ad335471",
+        "type": "github"
+      },
+      "original": {
+        "owner": "edger-dev",
+        "repo": "jig",
+        "type": "github"
+      }
+    },
+    "mdbook-beans": {
+      "inputs": {
+        "crane": [
+          "jig",
+          "crane"
+        ],
+        "fenix": [
+          "jig",
+          "fenix"
+        ],
+        "flake-utils": [
+          "jig",
+          "flake-utils"
+        ],
+        "nixpkgs": [
+          "jig",
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1774924792,
+        "narHash": "sha256-pUdWCC2waY/DeDEs3DYDyNnSDnQF6puE0OAswVAmLmw=",
+        "owner": "edger-dev",
+        "repo": "mdbook-beans",
+        "rev": "86b19955dcd417f590ec6b050655b6452dc7fcb9",
+        "type": "github"
+      },
+      "original": {
+        "owner": "edger-dev",
+        "ref": "main",
+        "repo": "mdbook-beans",
+        "type": "github"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1775126147,
+        "narHash": "sha256-J0dZU4atgcfo4QvM9D92uQ0Oe1eLTxBVXjJzdEMQpD0=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "8d8c1fa5b412c223ffa47410867813290cdedfef",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixpkgs-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "jig": "jig"
+      }
+    },
+    "rust-analyzer-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1775174431,
+        "narHash": "sha256-jSw1C5MuyySiCpPgjdR+H0wPR3AgPRuylLunw+yd7A0=",
+        "owner": "rust-lang",
+        "repo": "rust-analyzer",
+        "rev": "9767050b2db436f5a770c5f91a548c88fd91ec71",
+        "type": "github"
+      },
+      "original": {
+        "owner": "rust-lang",
+        "ref": "nightly",
+        "repo": "rust-analyzer",
+        "type": "github"
+      }
+    },
+    "systems": {
+      "locked": {
+        "lastModified": 1681028828,
+        "narHash": "sha256-Vy1rq5AaRuLzOxct8nz4T6wlgyUR7zLU309k9mBC768=",
+        "owner": "nix-systems",
+        "repo": "default",
+        "rev": "da67096a3b9bf56a91d16901293e51ba5b49a27e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nix-systems",
+        "repo": "default",
+        "type": "github"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

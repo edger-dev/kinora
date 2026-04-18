@@ -12,3 +12,14 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+[workspace.dependencies]
+facet = "v0.46.0"
+facet-styx = "v3.0.2"
+
+log = { version = "0.4.29", features = ["kv"] }
+rootcause = "v0.12.1"
+fasttrace = "v0.7.17"
+
+# Tests
+rstest = "0.26.1"
