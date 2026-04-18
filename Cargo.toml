@@ -3,7 +3,7 @@ resolver = "2"
 members = []
 
 [workspace.package]
-edition = "2021"
+edition = "2024"
 license = "MIT"
 repository = "https://github.com/edger-dev/kinora"
 
@@ -14,12 +14,33 @@ unsafe_code = "forbid"
 all = { level = "warn", priority = -1 }
 
 [workspace.dependencies]
-facet = "v0.46.0"
-facet-styx = "v3.0.2"
 
+# Serialization
+facet = "0.46.0"
+facet-styx = "3.0.2"
+facet-json = "0.46.0"
+
+# Hashing
+blake3 = "1.8.4"
+
+# Time
+jiff = "0.2.23"
+
+# Git
+gix = "0.81.0"
+
+# Markdown
+pulldown-cmark = "0.13.3"
+
+# Logging & tracing
 log = { version = "0.4.29", features = ["kv"] }
-rootcause = "v0.12.1"
-fasttrace = "v0.7.17"
+logforth = "0.29.1"
+logforth-append-fastrace = "0.3.0"
+fastrace = "0.7.17"
+rootcause = "0.12.1"
+
+# CLI
+figue = "2.0.3"
 
 # Tests
 rstest = "0.26.1"
