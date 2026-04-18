@@ -79,9 +79,15 @@ fn main() -> ExitCode {
             let args = RenderRunArgs { cache_dir };
             match run_render(&cwd, args) {
                 Ok(report) => {
+                    let skipped_note = if report.skipped_count == 0 {
+                        String::new()
+                    } else {
+                        format!(" (skipped {} forked)", report.skipped_count)
+                    };
                     println!(
-                        "rendered {} pages into {}",
+                        "rendered {} pages{} into {}",
                         report.page_count,
+                        skipped_note,
                         report.cache_path.display(),
                     );
                     ExitCode::SUCCESS

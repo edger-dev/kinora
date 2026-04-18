@@ -17,6 +17,7 @@ pub struct RenderRunArgs {
 pub struct RenderReport {
     pub cache_path: PathBuf,
     pub page_count: usize,
+    pub skipped_count: usize,
 }
 
 pub fn run_render(cwd: &Path, args: RenderRunArgs) -> Result<RenderReport, CliError> {
@@ -29,13 +30,18 @@ pub fn run_render(cwd: &Path, args: RenderRunArgs) -> Result<RenderReport, CliEr
     let cache = CachePath::from_repo_url(&config.repo_url);
     let cache_path = match args.cache_dir {
         Some(override_dir) => PathBuf::from(override_dir),
-        None => default_cache_root()?.join(cache.subdir()),
+        None => {
+            let xdg = std::env::var("XDG_CACHE_HOME").ok();
+            let home = std::env::var("HOME").ok();
+            resolve_cache_root(xdg.as_deref(), home.as_deref())?.join(cache.subdir())
+        }
     };
 
     let resolver = Resolver::load(&kin_root)?;
     let branch = current_branch_label(&kin_root)?;
     let book = render_for_branch(&resolver, &branch)?;
     let page_count = book.pages.len();
+    let skipped_count = book.skipped.len();
 
     let title = if cache.name.is_empty() {
         "kinora".to_owned()
@@ -44,19 +50,21 @@ pub fn run_render(cwd: &Path, args: RenderRunArgs) -> Result<RenderReport, CliEr
     };
     write_book(&cache_path, &title, &book)?;
 
-    Ok(RenderReport { cache_path, page_count })
+    Ok(RenderReport { cache_path, page_count, skipped_count })
 }
 
-fn default_cache_root() -> Result<PathBuf, CliError> {
-    if let Ok(x) = std::env::var("XDG_CACHE_HOME")
+/// Pure resolver so the XDG/HOME branching can be unit-tested without
+/// touching process env.
+fn resolve_cache_root(xdg: Option<&str>, home: Option<&str>) -> Result<PathBuf, CliError> {
+    if let Some(x) = xdg
         && !x.is_empty()
     {
         return Ok(PathBuf::from(x).join("kinora"));
     }
-    if let Ok(home) = std::env::var("HOME")
-        && !home.is_empty()
+    if let Some(h) = home
+        && !h.is_empty()
     {
-        return Ok(PathBuf::from(home).join(".cache").join("kinora"));
+        return Ok(PathBuf::from(h).join(".cache").join("kinora"));
     }
     Err(CliError::CacheHomeUnresolved)
 }
@@ -147,6 +155,34 @@ mod tests {
         };
         run_render(tmp.path(), args).unwrap();
         assert!(!stale.exists());
+    }
+
+    #[test]
+    fn resolve_cache_root_prefers_xdg_over_home() {
+        let got = resolve_cache_root(Some("/xdg"), Some("/home")).unwrap();
+        assert_eq!(got, PathBuf::from("/xdg/kinora"));
+    }
+
+    #[test]
+    fn resolve_cache_root_falls_back_to_home_when_xdg_absent() {
+        assert_eq!(
+            resolve_cache_root(None, Some("/home/user")).unwrap(),
+            PathBuf::from("/home/user/.cache/kinora"),
+        );
+    }
+
+    #[test]
+    fn resolve_cache_root_ignores_empty_env_values() {
+        assert_eq!(
+            resolve_cache_root(Some(""), Some("/home/user")).unwrap(),
+            PathBuf::from("/home/user/.cache/kinora"),
+        );
+    }
+
+    #[test]
+    fn resolve_cache_root_errors_when_nothing_resolves() {
+        let err = resolve_cache_root(None, None).unwrap_err();
+        assert!(matches!(err, CliError::CacheHomeUnresolved));
     }
 
     #[test]

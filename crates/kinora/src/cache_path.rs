@@ -65,7 +65,10 @@ fn normalize_url(url: &str) -> String {
         }
     };
     let host_lc = host.to_ascii_lowercase();
-    let path_clean = path.trim_end_matches('/').trim_end_matches(".git");
+    let path_trimmed = path.trim_end_matches('/');
+    let path_clean = path_trimmed
+        .strip_suffix(".git")
+        .unwrap_or(path_trimmed);
 
     if path_clean.is_empty() {
         host_lc
@@ -202,6 +205,15 @@ mod tests {
     fn name_is_last_path_segment() {
         let c = CachePath::from_repo_url("https://example.com/org/team/repo");
         assert_eq!(c.name, "repo");
+    }
+
+    #[test]
+    fn double_git_suffix_only_strips_once() {
+        // trim_end_matches(".git") would strip both copies and collide with
+        // the single-suffix form; strip_suffix keeps them distinct.
+        let a = CachePath::from_repo_url("https://example.com/foo.git.git");
+        let b = CachePath::from_repo_url("https://example.com/foo.git");
+        assert_ne!(a, b);
     }
 
     #[test]

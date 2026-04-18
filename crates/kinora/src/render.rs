@@ -35,10 +35,34 @@ pub struct RenderedPage {
     pub body: String,
 }
 
+/// Identity we chose not to render and why — surfaced so the CLI can tell
+/// the user when a fork (or similar) caused silent drops.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedIdentity {
+    pub id: String,
+    pub reason: SkipReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkipReason {
+    MultipleHeads,
+}
+
+impl std::fmt::Display for SkipReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SkipReason::MultipleHeads => {
+                write!(f, "multiple heads (fork unresolved by branch tiebreaker)")
+            }
+        }
+    }
+}
+
 /// Ordered collection of rendered pages.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Book {
     pub pages: Vec<RenderedPage>,
+    pub skipped: Vec<SkippedIdentity>,
 }
 
 #[derive(Debug)]
@@ -97,6 +121,7 @@ pub fn render_for_branch(
 ) -> Result<Book, RenderError> {
     let branch = branch.into();
     let mut entries: Vec<(String, String, String, String)> = Vec::new(); // (name, id, kind, body)
+    let mut skipped: Vec<SkippedIdentity> = Vec::new();
 
     let mut ids: Vec<&String> = resolver.identities().keys().collect();
     ids.sort();
@@ -104,7 +129,13 @@ pub fn render_for_branch(
     for id in ids {
         let resolved = match resolver.resolve_by_id(id) {
             Ok(r) => r,
-            Err(ResolveError::MultipleHeads { .. }) => continue,
+            Err(ResolveError::MultipleHeads { .. }) => {
+                skipped.push(SkippedIdentity {
+                    id: id.clone(),
+                    reason: SkipReason::MultipleHeads,
+                });
+                continue;
+            }
             Err(e) => return Err(RenderError::Resolve(e)),
         };
         let kind = resolved.head.kind.clone();
@@ -143,7 +174,7 @@ pub fn render_for_branch(
         })
         .collect();
 
-    Ok(Book { pages })
+    Ok(Book { pages, skipped })
 }
 
 fn render_body(
@@ -306,7 +337,17 @@ pub fn write_book(cache_root: &Path, title: &str, book: &Book) -> Result<(), Ren
 }
 
 fn book_toml(title: &str) -> String {
-    let escaped = title.replace('\\', "\\\\").replace('"', "\\\"");
+    let mut escaped = String::with_capacity(title.len());
+    for ch in title.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            c if c.is_control() => escaped.push_str(&format!("\\u{:04X}", c as u32)),
+            c => escaped.push(c),
+        }
+    }
     format!(
         "[book]\ntitle = \"{escaped}\"\nsrc = \"src\"\nauthors = [\"kinora\"]\n\n[output.html]\n",
     )
@@ -614,6 +655,15 @@ mod tests {
     }
 
     #[test]
+    fn book_toml_escapes_control_chars_in_title() {
+        let cache = TempDir::new().unwrap();
+        let book = Book::default();
+        write_book(cache.path(), "a\nb\"c\\d", &book).unwrap();
+        let toml = std::fs::read_to_string(cache.path().join("book.toml")).unwrap();
+        assert!(toml.contains(r#"title = "a\nb\"c\\d""#), "got: {toml}");
+    }
+
+    #[test]
     fn book_toml_includes_title_and_src_dir() {
         let cache = TempDir::new().unwrap();
         let book = Book::default();
@@ -644,6 +694,7 @@ mod tests {
                     body: "y".into(),
                 },
             ],
+            skipped: vec![],
         };
         let cache = TempDir::new().unwrap();
         write_book(cache.path(), "t", &book).unwrap();
@@ -655,18 +706,21 @@ mod tests {
     }
 
     #[test]
-    fn forked_identities_are_skipped() {
-        // An identity with multiple heads would fail `resolve_by_id`; the
-        // renderer skips it instead of blowing up the whole book.
+    fn forked_identity_is_surfaced_as_skipped_with_reason() {
+        // Build an unambiguous fork: HEAD points at a lineage that contains
+        // neither head, so the branch-aware tiebreaker can't pick a winner.
         let (_t, root) = setup();
         let birth = store_kino(&root, params("markdown", b"v1", "forked")).unwrap();
+
+        // Left head in a fresh lineage.
+        std::fs::remove_file(crate::paths::head_path(&root)).unwrap();
         let mut a = params("markdown", b"left", "forked");
         a.id = Some(birth.event.id.clone());
         a.parents = vec![birth.event.hash.clone()];
         a.ts = "2026-04-18T10:00:01Z".into();
         store_kino(&root, a).unwrap();
 
-        // Mint a sibling head in a fresh lineage.
+        // Right head in another fresh lineage.
         std::fs::remove_file(crate::paths::head_path(&root)).unwrap();
         let mut b = params("markdown", b"right", "forked");
         b.id = Some(birth.event.id.clone());
@@ -674,15 +728,20 @@ mod tests {
         b.ts = "2026-04-18T10:00:02Z".into();
         store_kino(&root, b).unwrap();
 
-        // Add a second, non-forked identity — it should still render.
+        // Independent "clean" identity; HEAD now points to its (fourth)
+        // lineage, which contains neither forked head.
+        std::fs::remove_file(crate::paths::head_path(&root)).unwrap();
         store_kino(&root, params("markdown", b"ok", "clean")).unwrap();
 
         let resolver = Resolver::load(&root).unwrap();
         let book = render_for_branch(&resolver, "main").unwrap();
+
         let titles: Vec<_> = book.pages.iter().map(|p| p.title.as_str()).collect();
+        assert!(!titles.contains(&"forked"), "forked should be skipped: {titles:?}");
         assert!(titles.contains(&"clean"));
-        // Note: the branch-aware tiebreaker may or may not pick a head for the
-        // forked identity depending on which lineage HEAD points at. The key
-        // guarantee is that the render does not error on it.
+
+        assert_eq!(book.skipped.len(), 1, "skipped: {:?}", book.skipped);
+        assert_eq!(book.skipped[0].id, birth.event.id);
+        assert_eq!(book.skipped[0].reason, SkipReason::MultipleHeads);
     }
 }
