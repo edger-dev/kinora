@@ -130,30 +130,34 @@ impl Ledger {
         read_events(&file)
     }
 
-    /// Write `event` to `.kinora/hot/<ab>/<event-hash>.jsonl`. Idempotent:
-    /// if the target file already exists, returns the hash without touching
-    /// the file (event hash is content-addressed, so an identical path
-    /// implies identical content).
+    /// Write `event` to `.kinora/hot/<ab>/<event-hash>.jsonl`. Crash-atomic
+    /// via tmp+rename: a crash mid-write leaves an orphan tmp but never a
+    /// truncated target, so a follow-up call always sees either a complete
+    /// file or no file at all. Idempotent: if the target already exists
+    /// (event hash is content-addressed, so identical path implies identical
+    /// content), returns the hash without rewriting.
     ///
-    /// Returns `(event_hash, was_new)` — `was_new` is true iff the file did
-    /// not exist before this call.
+    /// Returns `(event_hash, was_new)` — `was_new` is true iff the target
+    /// file did not exist before this call.
     pub fn write_event(&self, event: &Event) -> Result<(Hash, bool), LedgerError> {
         self.ensure_layout()?;
         let line = event.to_json_line()?;
         let event_hash = Hash::of_content(line.as_bytes());
         let path = hot_event_path(&self.kinora_root, &event_hash);
+        if path.is_file() {
+            return Ok((event_hash, false));
+        }
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        match fs::OpenOptions::new().create_new(true).write(true).open(&path) {
-            Ok(mut f) => {
-                f.write_all(line.as_bytes())?;
-                f.write_all(b"\n")?;
-                Ok((event_hash, true))
-            }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok((event_hash, false)),
-            Err(e) => Err(LedgerError::Io(e)),
+        let tmp = path.with_extension(format!("{HOT_EXT}.tmp"));
+        {
+            let mut f = fs::File::create(&tmp)?;
+            f.write_all(line.as_bytes())?;
+            f.write_all(b"\n")?;
         }
+        fs::rename(&tmp, &path)?;
+        Ok((event_hash, true))
     }
 
     /// Return every event stored under `.kinora/hot/`, deduped by event hash.
@@ -509,6 +513,34 @@ mod tests {
         let mut got = lm.read_all_events().unwrap();
         got.sort_by(|x, y| x.ts.cmp(&y.ts));
         assert_eq!(got, vec![ea, eb]);
+    }
+
+    #[test]
+    fn write_event_leaves_no_tmp_file_on_success() {
+        let (_t, l) = ledger();
+        let e = event("tmp-cleanup", "2026-04-19T09:00:00Z");
+        let (h, _) = l.write_event(&e).unwrap();
+        let shard = hot_dir(l.root()).join(h.shard());
+        let tmp = shard.join(format!("{}.jsonl.tmp", h.as_hex()));
+        assert!(!tmp.exists(), "orphan tmp left behind: {}", tmp.display());
+    }
+
+    #[test]
+    fn write_event_recovers_from_orphan_tmp_from_a_prior_crash() {
+        // Simulate a crash during a previous write that left a tmp file
+        // alongside no real event file. The next write should still succeed.
+        let (_t, l) = ledger();
+        let e = event("recover", "2026-04-19T09:00:00Z");
+        let event_hash = e.event_hash().unwrap();
+        let path = hot_event_path(l.root(), &event_hash);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let tmp = path.with_extension("jsonl.tmp");
+        fs::write(&tmp, b"garbage from a crash").unwrap();
+
+        let (h, was_new) = l.write_event(&e).unwrap();
+        assert_eq!(h, event_hash);
+        assert!(was_new);
+        assert!(path.is_file());
     }
 
     #[test]

@@ -552,6 +552,40 @@ mod tests {
     }
 
     #[test]
+    fn resolver_dedups_when_same_event_lives_in_both_hot_and_legacy() {
+        // During the transition, the same logical event may appear in both
+        // layouts — e.g. a legacy lineage file still on disk alongside a hot
+        // event file. Resolver must dedup by event hash so heads/parents don't
+        // double-count.
+        let (_t, root) = setup();
+        let ledger = Ledger::new(&root);
+        let store = ContentStore::new(&root);
+        store.ensure_layout().unwrap();
+        ledger.ensure_layout().unwrap();
+
+        let content_hash = store.write(b"same").unwrap();
+        let event = Event {
+            kind: "markdown".into(),
+            id: content_hash.as_hex().into(),
+            hash: content_hash.as_hex().into(),
+            parents: vec![],
+            ts: "2026-04-18T10:00:00Z".into(),
+            author: "yj".into(),
+            provenance: "dual-layout".into(),
+            metadata: BTreeMap::from([("name".into(), "dual".into())]),
+        };
+
+        ledger.mint_and_append(&event).unwrap();
+        let (_, was_new) = ledger.write_event(&event).unwrap();
+        assert!(was_new, "hot write should have created a new file");
+
+        let resolver = Resolver::load(&root).unwrap();
+        let identity = resolver.identities().get(&event.id).expect("identity present");
+        assert_eq!(identity.events.len(), 1, "duplicate event not deduped");
+        assert_eq!(identity.heads.len(), 1);
+    }
+
+    #[test]
     fn fork_from_hot_events_produces_multiple_heads() {
         // Under the hot-ledger layout, HEAD-based tiebreak no longer applies
         // to new events (each lives in its own file). Forks therefore always

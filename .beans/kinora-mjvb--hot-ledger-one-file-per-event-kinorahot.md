@@ -1,11 +1,11 @@
 ---
 # kinora-mjvb
 title: 'Hot ledger: one-file-per-event (.kinora/hot/)'
-status: in-progress
+status: completed
 type: feature
 priority: normal
 created_at: 2026-04-19T05:46:36Z
-updated_at: 2026-04-19T06:00:42Z
+updated_at: 2026-04-19T06:06:23Z
 parent: kinora-xi21
 ---
 
@@ -92,3 +92,29 @@ TDD three-commit split:
 - **Legacy lineages**: keep `ledger_dir`/`read_all_lineages` *read path* working; stop writing there. `Identity.lineages` field keeps the shape; new entries get event-hash-shorthash as their "lineage" label.
 - **HEAD**: no longer written by `store_kino`. Still read for `current_branch_label` and `head_for_current_lineage` (legacy only). In absence, branch label defaults to `"main"`.
 - **StoredKino**: keep field names (`lineage`, `was_new_lineage`) for back-compat; `lineage` = event-hash-shorthash, `was_new_lineage` = true iff file didn't already exist.
+
+## Summary of Changes
+
+Implemented phase 1 of `kinora-xi21`: one-file-per-event hot ledger layout.
+
+**Files touched**
+- `crates/kinora/src/paths.rs` — added `hot_dir`, `hot_event_path`, `HOT_DIR`, `HOT_EXT`
+- `crates/kinora/src/event.rs` — added `Event::event_hash()` (BLAKE3 of canonical JSON line)
+- `crates/kinora/src/ledger.rs` — added `write_event` (crash-atomic via tmp+rename) + `read_all_events` (shard-scan + dedup); legacy `read_all_lineages` retained
+- `crates/kinora/src/kino.rs` — `store_kino` now routes through `write_event`; `StoredKino.lineage` = event-hash shorthash
+- `crates/kinora/src/resolve.rs` — `Resolver::load` unions legacy + hot events, deduping by event hash
+- `crates/kinora/src/render.rs` — fork test simplified (no HEAD manipulation)
+- `crates/kinora-cli/src/store.rs`, `crates/kinora-cli/src/resolve.rs` — HEAD-write assumptions relaxed
+
+**Key decisions**
+- Event hash = full 64-hex BLAKE3 of `Event::to_json_line()` (facet-json already produces canonical sorted-key output).
+- Dedup via tmp+rename in `write_event`: crash-safe (orphan tmp never produces a half-written real file). Content-addressed path means identical content always maps to the same file.
+- Legacy `.kinora/ledger/<lineage>.jsonl` readers kept — phase 1 is additive; migration deferred to later phase.
+- HEAD is no longer written by `store_kino`; retained only as a legacy tiebreak hint when reading old ledger files.
+
+**Commits**
+- `1f99f95` hot ledger: add one-file-per-event API (kinora-mjvb)
+- `dbfa7d9` hot ledger: switch store + resolver to write/read via hot/ (kinora-mjvb)
+- (pending) review fixes: crash-atomicity + dual-layout dedup test
+
+**Tests**: 218 workspace tests pass. Dogfooded against existing RFC-0003 legacy lineage data (still resolves).
