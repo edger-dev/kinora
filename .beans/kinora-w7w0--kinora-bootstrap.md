@@ -3,8 +3,9 @@
 title: Kinora bootstrap
 status: todo
 type: epic
+priority: normal
 created_at: 2026-04-18T09:16:59Z
-updated_at: 2026-04-18T09:16:59Z
+updated_at: 2026-04-19T05:38:46Z
 ---
 
 ## Scope
@@ -28,3 +29,9 @@ Beans-sync (kinograph → beans task spec) is deferred to post-bootstrap.
 ## Done when
 
 All child features complete; dogfood surfaces no blocking issues.
+
+## Post-bootstrap direction
+
+Canonical history model (hot ledger + chained root-kinograph snapshots) is captured in `kinora-xi21`. Once the bootstrap CLI (store/resolve/render) is solid, the architecture evolves along that path: one-file-per-event hot ledger, `root` kind, compaction on main, multiple named roots with `inbox` as default.
+
+The current ledger-per-kino layout in the bootstrap is explicitly transitional — `kinora-xi21` supersedes it.
