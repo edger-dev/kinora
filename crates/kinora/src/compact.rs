@@ -547,9 +547,17 @@ pub fn compact_root(
 
 /// Copy `pin` + `version` from prior root's entries into the freshly built
 /// root, for kinos still owned by this root. Unpinned prior entries are
-/// ignored — the rebuilt head already represents them. A kino reassigned
-/// away from this root simply won't appear in the rebuild, so ownership
-/// wins over pin on cross-root moves.
+/// ignored — the rebuilt head already represents them.
+///
+/// Pin wins over head: if the rebuild would otherwise bump an entry to a
+/// newer head, pin propagation overrides `version` back to the pinned
+/// snapshot. This is the whole point of pinning — the user froze that
+/// specific version and new stores for the same kino id should not
+/// shadow it until the pin is released.
+///
+/// Ownership wins over pin on cross-root moves: a kino reassigned away
+/// from this root simply won't appear in the rebuild (routing filtered
+/// it out), so its prior pinned entry is silently dropped.
 fn propagate_pins(root: &mut RootKinograph, prior: Option<&RootKinograph>) {
     let Some(prior) = prior else { return };
     let pinned: BTreeMap<&str, &RootEntry> = prior
@@ -1918,5 +1926,95 @@ roots {
         );
         assert!(hot_event_exists(&root, &a));
         assert!(hot_event_exists(&root, &b));
+    }
+
+    // -- Ownership wins over pin on cross-root reassign -----------------
+
+    #[test]
+    fn pin_in_root_a_is_dropped_when_kino_is_reassigned_to_root_b() {
+        let (_t, root) = setup();
+        write_config(
+            &root,
+            r#"repo-url "https://example.com/x.git"
+roots {
+  rfcs { policy "never" }
+  designs { policy "never" }
+}
+"#,
+        );
+        let k = store_md(&root, b"v", "v", "2024-04-19T10:00:00Z");
+        let first = write_assign_for(&root, &k.id, "rfcs", vec![], "2024-04-19T10:00:01Z");
+        compact_root(&root, "rfcs", params("yj", "2026-04-19T10:00:00Z")).unwrap();
+        overwrite_root_with_pin(&root, "rfcs", &k.id, &k.hash, "2026-04-19T10:00:01Z");
+        // Reassign to designs — this supersedes the rfcs assign.
+        write_assign_for(
+            &root,
+            &k.id,
+            "designs",
+            vec![first.as_hex().to_owned()],
+            "2026-04-19T11:00:00Z",
+        );
+        // Both roots run a compact. The pin on rfcs must not survive the
+        // move — routing now puts the kino in designs, so rfcs' rebuild
+        // has no entry for it at all.
+        let rfcs = compact_root(&root, "rfcs", params("yj", "2026-04-19T12:00:00Z")).unwrap();
+        let designs = compact_root(&root, "designs", params("yj", "2026-04-19T12:00:00Z")).unwrap();
+        let rfcs_ids = root_ids(&root, &rfcs.new_version.unwrap());
+        let designs_ids = root_ids(
+            &root,
+            &designs.new_version.expect("designs must materialize"),
+        );
+        assert!(rfcs_ids.is_empty(), "rfcs lost ownership; pin must drop");
+        assert_eq!(designs_ids, vec![k.id], "designs now owns the kino");
+    }
+
+    // -- MaxAge prunes old assigns alongside old store events -----------
+
+    #[test]
+    fn max_age_prunes_old_assign_events_too() {
+        let (_t, root) = setup();
+        write_config(
+            &root,
+            r#"repo-url "https://example.com/x.git"
+roots {
+  rfcs { policy "7d" }
+}
+"#,
+        );
+        // Old store + old assign, both 14 days stale; fresh store + fresh
+        // assign both under 1 day. The old assign still needs to be on
+        // disk at compact time (else the old kino wouldn't route to rfcs),
+        // so we age both stores into the past but run compact at `now`.
+        let old = store_md(&root, b"old", "old", "2026-04-05T10:00:00Z");
+        let fresh = store_md(&root, b"fresh", "fresh", "2026-04-18T10:00:00Z");
+        let old_assign_hash =
+            write_assign_for(&root, &old.id, "rfcs", vec![], "2026-04-05T10:00:01Z");
+        let fresh_assign_hash =
+            write_assign_for(&root, &fresh.id, "rfcs", vec![], "2026-04-18T10:00:01Z");
+
+        // Find the full assign events so we can ask hot_event_exists about
+        // their JSON-line hashes (mirrors what the prune path keys on).
+        let events = Ledger::new(&root).read_all_events().unwrap();
+        let old_assign = events
+            .iter()
+            .find(|e| e.event_hash().unwrap() == old_assign_hash)
+            .expect("old assign present")
+            .clone();
+        let fresh_assign = events
+            .iter()
+            .find(|e| e.event_hash().unwrap() == fresh_assign_hash)
+            .expect("fresh assign present")
+            .clone();
+
+        compact_root(&root, "rfcs", params("yj", "2026-04-19T10:00:00Z")).unwrap();
+
+        assert!(
+            !hot_event_exists(&root, &old_assign),
+            "stale assign event must be pruned"
+        );
+        assert!(
+            hot_event_exists(&root, &fresh_assign),
+            "fresh assign event must survive"
+        );
     }
 }
