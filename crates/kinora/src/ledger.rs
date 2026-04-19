@@ -263,16 +263,16 @@ mod tests {
 
     fn event(n: &str, ts: &str) -> Event {
         let h = Hash::of_content(n.as_bytes());
-        Event {
-            kind: "markdown".into(),
-            id: h.as_hex().into(),
-            hash: h.as_hex().into(),
-            parents: vec![],
-            ts: ts.into(),
-            author: "yj".into(),
-            provenance: "test".into(),
-            metadata: BTreeMap::from([("name".to_string(), n.to_string())]),
-        }
+        Event::new_store(
+            "markdown".into(),
+            h.as_hex().into(),
+            h.as_hex().into(),
+            vec![],
+            ts.into(),
+            "yj".into(),
+            "test".into(),
+            BTreeMap::from([("name".to_string(), n.to_string())]),
+        )
     }
 
     #[test]

@@ -340,16 +340,16 @@ mod tests {
         use kinora::event::Event;
         use std::collections::BTreeMap as Btm;
         kinora::kino::StoredKino {
-            event: Event {
-                kind: "markdown".into(),
-                id: "aa".repeat(32),
-                hash: "bb".repeat(32),
-                parents: vec![],
-                ts: "2026-04-19T10:00:00Z".into(),
-                author: "yj".into(),
-                provenance: "unit".into(),
-                metadata: Btm::new(),
-            },
+            event: Event::new_store(
+                "markdown".into(),
+                "aa".repeat(32),
+                "bb".repeat(32),
+                vec![],
+                "2026-04-19T10:00:00Z".into(),
+                "yj".into(),
+                "unit".into(),
+                Btm::new(),
+            ),
             lineage: "deadbeef".into(),
             was_new_lineage,
         }

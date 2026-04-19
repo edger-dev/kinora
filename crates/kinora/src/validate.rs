@@ -155,30 +155,30 @@ mod tests {
 
     fn birth(kind: &str) -> Event {
         let h = Hash::of_content(b"content");
-        Event {
-            kind: kind.into(),
-            id: h.as_hex().into(),
-            hash: h.as_hex().into(),
-            parents: vec![],
-            ts: "2026-04-18T09:00:00Z".into(),
-            author: "yj".into(),
-            provenance: "test".into(),
-            metadata: BTreeMap::new(),
-        }
+        Event::new_store(
+            kind.into(),
+            h.as_hex().into(),
+            h.as_hex().into(),
+            vec![],
+            "2026-04-18T09:00:00Z".into(),
+            "yj".into(),
+            "test".into(),
+            BTreeMap::new(),
+        )
     }
 
     fn version_from(birth: &Event) -> Event {
         let new_hash = Hash::of_content(b"content-v2");
-        Event {
-            kind: birth.kind.clone(),
-            id: birth.id.clone(),
-            hash: new_hash.as_hex().into(),
-            parents: vec![birth.hash.clone()],
-            ts: "2026-04-18T09:01:00Z".into(),
-            author: birth.author.clone(),
-            provenance: birth.provenance.clone(),
-            metadata: BTreeMap::new(),
-        }
+        Event::new_store(
+            birth.kind.clone(),
+            birth.id.clone(),
+            new_hash.as_hex().into(),
+            vec![birth.hash.clone()],
+            "2026-04-18T09:01:00Z".into(),
+            birth.author.clone(),
+            birth.provenance.clone(),
+            BTreeMap::new(),
+        )
     }
 
     #[test]

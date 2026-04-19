@@ -4,7 +4,16 @@ use facet::Facet;
 
 use crate::hash::Hash;
 
+/// Canonical value of `Event::event_kind` for content-store events.
+pub const EVENT_KIND_STORE: &str = "store";
+
 /// Append-only ledger event.
+///
+/// `event_kind` is the top-level discriminator introduced in phase 3 — it
+/// distinguishes content-store events from non-store events (e.g. `assign`,
+/// metadata resolutions). Consumers that operate on content (resolver,
+/// render, compact) filter on `is_store_event()` so non-store events slide
+/// past harmlessly until their dedicated handler lands.
 ///
 /// Fields stored as String for facet-json round-trip simplicity in MVP.
 /// Typed accessors (`id_hash`, `content_hash`, `parent_hashes`) parse on demand.
@@ -13,6 +22,7 @@ use crate::hash::Hash;
 /// deferred post-bootstrap.
 #[derive(Facet, Debug, Clone, PartialEq)]
 pub struct Event {
+    pub event_kind: String,
     pub kind: String,
     pub id: String,
     pub hash: String,
@@ -21,6 +31,37 @@ pub struct Event {
     pub author: String,
     pub provenance: String,
     pub metadata: BTreeMap<String, String>,
+}
+
+/// Pre-phase-3 on-disk event shape, for backward-compat parsing of
+/// legacy hot files that were written before the `event_kind`
+/// discriminator landed. Promoted to `Event` with `event_kind = "store"`.
+#[derive(Facet, Debug, Clone, PartialEq)]
+struct LegacyEvent {
+    kind: String,
+    id: String,
+    hash: String,
+    parents: Vec<String>,
+    ts: String,
+    author: String,
+    provenance: String,
+    metadata: BTreeMap<String, String>,
+}
+
+impl From<LegacyEvent> for Event {
+    fn from(l: LegacyEvent) -> Self {
+        Event {
+            event_kind: EVENT_KIND_STORE.to_owned(),
+            kind: l.kind,
+            id: l.id,
+            hash: l.hash,
+            parents: l.parents,
+            ts: l.ts,
+            author: l.author,
+            provenance: l.provenance,
+            metadata: l.metadata,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -41,6 +82,38 @@ impl std::fmt::Display for EventError {
 impl std::error::Error for EventError {}
 
 impl Event {
+    /// Construct a store-kind event. Syntactic sugar so call sites don't
+    /// have to repeat `event_kind: EVENT_KIND_STORE.into()`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_store(
+        kind: String,
+        id: String,
+        hash: String,
+        parents: Vec<String>,
+        ts: String,
+        author: String,
+        provenance: String,
+        metadata: BTreeMap<String, String>,
+    ) -> Self {
+        Event {
+            event_kind: EVENT_KIND_STORE.to_owned(),
+            kind,
+            id,
+            hash,
+            parents,
+            ts,
+            author,
+            provenance,
+            metadata,
+        }
+    }
+
+    /// True iff this event belongs to the content-store track (the only
+    /// event kind consumers like resolver/render/compact should follow).
+    pub fn is_store_event(&self) -> bool {
+        self.event_kind == EVENT_KIND_STORE
+    }
+
     pub fn to_json_line(&self) -> Result<String, EventError> {
         let s =
             facet_json::to_string(self).map_err(|e| EventError::Serialize(e.to_string()))?;
@@ -48,6 +121,8 @@ impl Event {
     }
 
     pub fn from_json_line(line: &str) -> Result<Self, EventError> {
+        // STUB (hxmw-szkl commit-1): no legacy fallback. Commit 2 adds the
+        // LegacyEvent branch so pre-phase-3 hot files parse as store events.
         facet_json::from_str(line).map_err(|e| EventError::Parse(e.to_string()))
     }
 
@@ -76,20 +151,16 @@ mod tests {
     fn sample_event() -> Event {
         let content = b"hello kinora";
         let h = Hash::of_content(content);
-        Event {
-            kind: "markdown".into(),
-            id: h.as_hex().into(),
-            hash: h.as_hex().into(),
-            parents: vec![],
-            ts: "2026-04-18T09:20:00Z".into(),
-            author: "yj".into(),
-            provenance: "test".into(),
-            metadata: {
-                let mut m = BTreeMap::new();
-                m.insert("name".into(), "greeting".into());
-                m
-            },
-        }
+        Event::new_store(
+            "markdown".into(),
+            h.as_hex().into(),
+            h.as_hex().into(),
+            vec![],
+            "2026-04-18T09:20:00Z".into(),
+            "yj".into(),
+            "test".into(),
+            BTreeMap::from([("name".to_string(), "greeting".to_string())]),
+        )
     }
 
     #[test]
@@ -111,9 +182,45 @@ mod tests {
     fn json_line_contains_expected_fields() {
         let e = sample_event();
         let line = e.to_json_line().unwrap();
-        for key in ["kind", "id", "hash", "parents", "ts", "author", "provenance", "metadata"] {
+        for key in [
+            "event_kind",
+            "kind",
+            "id",
+            "hash",
+            "parents",
+            "ts",
+            "author",
+            "provenance",
+            "metadata",
+        ] {
             assert!(line.contains(key), "missing {key} in {line}");
         }
+    }
+
+    #[test]
+    fn new_store_sets_event_kind_to_store() {
+        let e = sample_event();
+        assert_eq!(e.event_kind, EVENT_KIND_STORE);
+        assert!(e.is_store_event());
+    }
+
+    #[test]
+    fn non_store_event_kind_is_not_is_store_event() {
+        let mut e = sample_event();
+        e.event_kind = "assign".into();
+        assert!(!e.is_store_event());
+    }
+
+    #[test]
+    fn legacy_event_line_parses_as_store_event() {
+        // A JSON line written by pre-phase-3 code — no `event_kind` field.
+        // from_json_line must accept it and materialize as a store event.
+        let legacy = r#"{"kind":"markdown","id":"aa","hash":"aa","parents":[],"ts":"2026-04-18T09:20:00Z","author":"yj","provenance":"test","metadata":{"name":"greeting"}}"#;
+        let got = Event::from_json_line(legacy).unwrap();
+        assert!(got.is_store_event(), "legacy event must parse as store");
+        assert_eq!(got.kind, "markdown");
+        assert_eq!(got.id, "aa");
+        assert_eq!(got.metadata.get("name").map(String::as_str), Some("greeting"));
     }
 
     #[test]
@@ -170,5 +277,15 @@ mod tests {
         b.metadata.insert("name".into(), "n".into());
 
         assert_eq!(a.event_hash().unwrap(), b.event_hash().unwrap());
+    }
+
+    #[test]
+    fn event_kind_differs_from_content_kind() {
+        // `event_kind` discriminates the event track; `kind` is the content
+        // blob kind. They live independently — a store-track event can
+        // carry any content kind.
+        let e = sample_event();
+        assert_eq!(e.event_kind, "store");
+        assert_eq!(e.kind, "markdown");
     }
 }

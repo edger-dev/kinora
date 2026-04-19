@@ -1,11 +1,11 @@
 ---
 # kinora-szkl
 title: 'Phase 3.2: event schema generalization (store vs non-store events)'
-status: todo
+status: in-progress
 type: task
 priority: normal
 created_at: 2026-04-19T10:16:54Z
-updated_at: 2026-04-19T10:16:57Z
+updated_at: 2026-04-19T10:57:00Z
 parent: kinora-hxmw
 ---
 

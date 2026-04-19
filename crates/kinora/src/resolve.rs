@@ -470,44 +470,44 @@ mod tests {
 
         // Birth + v2 sharing one legacy lineage file.
         let birth_hash = store.write("markdown", b"v1").unwrap();
-        let birth = Event {
-            kind: "markdown".into(),
-            id: birth_hash.as_hex().into(),
-            hash: birth_hash.as_hex().into(),
-            parents: vec![],
-            ts: "2026-04-18T10:00:00Z".into(),
-            author: "yj".into(),
-            provenance: "legacy".into(),
-            metadata: BTreeMap::from([("name".into(), "doc".into())]),
-        };
+        let birth = Event::new_store(
+            "markdown".into(),
+            birth_hash.as_hex().into(),
+            birth_hash.as_hex().into(),
+            vec![],
+            "2026-04-18T10:00:00Z".into(),
+            "yj".into(),
+            "legacy".into(),
+            BTreeMap::from([("name".into(), "doc".into())]),
+        );
         let sh_a = ledger.mint_and_append(&birth).unwrap();
 
         let v2_hash = store.write("markdown", b"v2").unwrap();
-        let v2 = Event {
-            kind: "markdown".into(),
-            id: birth.id.clone(),
-            hash: v2_hash.as_hex().into(),
-            parents: vec![birth.hash.clone()],
-            ts: "2026-04-18T10:00:01Z".into(),
-            author: "yj".into(),
-            provenance: "legacy".into(),
-            metadata: BTreeMap::from([("name".into(), "doc".into())]),
-        };
+        let v2 = Event::new_store(
+            "markdown".into(),
+            birth.id.clone(),
+            v2_hash.as_hex().into(),
+            vec![birth.hash.clone()],
+            "2026-04-18T10:00:01Z".into(),
+            "yj".into(),
+            "legacy".into(),
+            BTreeMap::from([("name".into(), "doc".into())]),
+        );
         ledger.append_to_head(&v2).unwrap();
 
         // Sibling head in a separate legacy lineage file.
         std::fs::remove_file(crate::paths::head_path(&root)).unwrap();
         let sibling_hash = store.write("markdown", b"right").unwrap();
-        let sibling = Event {
-            kind: "markdown".into(),
-            id: birth.id.clone(),
-            hash: sibling_hash.as_hex().into(),
-            parents: vec![birth.hash.clone()],
-            ts: "2026-04-18T10:00:02Z".into(),
-            author: "yj".into(),
-            provenance: "legacy".into(),
-            metadata: BTreeMap::from([("name".into(), "doc".into())]),
-        };
+        let sibling = Event::new_store(
+            "markdown".into(),
+            birth.id.clone(),
+            sibling_hash.as_hex().into(),
+            vec![birth.hash.clone()],
+            "2026-04-18T10:00:02Z".into(),
+            "yj".into(),
+            "legacy".into(),
+            BTreeMap::from([("name".into(), "doc".into())]),
+        );
         ledger.mint_and_append(&sibling).unwrap();
 
         // Point HEAD at the first (A-lineage) file.
@@ -533,16 +533,16 @@ mod tests {
         let ledger = Ledger::new(&root);
         let store = ContentStore::new(&root);
         let legacy_hash = store.write("markdown", b"bye").unwrap();
-        let legacy_event = Event {
-            kind: "markdown".into(),
-            id: legacy_hash.as_hex().into(),
-            hash: legacy_hash.as_hex().into(),
-            parents: vec![],
-            ts: "2026-04-18T10:00:01Z".into(),
-            author: "yj".into(),
-            provenance: "legacy".into(),
-            metadata: BTreeMap::from([("name".into(), "b".into())]),
-        };
+        let legacy_event = Event::new_store(
+            "markdown".into(),
+            legacy_hash.as_hex().into(),
+            legacy_hash.as_hex().into(),
+            vec![],
+            "2026-04-18T10:00:01Z".into(),
+            "yj".into(),
+            "legacy".into(),
+            BTreeMap::from([("name".into(), "b".into())]),
+        );
         std::fs::remove_file(crate::paths::head_path(&root)).ok();
         ledger.mint_and_append(&legacy_event).unwrap();
 
@@ -564,16 +564,16 @@ mod tests {
         ledger.ensure_layout().unwrap();
 
         let content_hash = store.write("markdown", b"same").unwrap();
-        let event = Event {
-            kind: "markdown".into(),
-            id: content_hash.as_hex().into(),
-            hash: content_hash.as_hex().into(),
-            parents: vec![],
-            ts: "2026-04-18T10:00:00Z".into(),
-            author: "yj".into(),
-            provenance: "dual-layout".into(),
-            metadata: BTreeMap::from([("name".into(), "dual".into())]),
-        };
+        let event = Event::new_store(
+            "markdown".into(),
+            content_hash.as_hex().into(),
+            content_hash.as_hex().into(),
+            vec![],
+            "2026-04-18T10:00:00Z".into(),
+            "yj".into(),
+            "dual-layout".into(),
+            BTreeMap::from([("name".into(), "dual".into())]),
+        );
 
         ledger.mint_and_append(&event).unwrap();
         let (_, was_new) = ledger.write_event(&event).unwrap();
@@ -607,6 +607,36 @@ mod tests {
         let resolver = Resolver::load(&root).unwrap();
         let err = resolver.resolve_by_id(&birth.event.id).unwrap_err();
         assert!(matches!(err, ResolveError::MultipleHeads { .. }));
+    }
+
+    #[test]
+    fn resolver_ignores_non_store_events() {
+        // Hand-forge a non-store (e.g. assign-track) event and write it to
+        // the hot ledger. Resolver::load must skip it so the identity it
+        // carries doesn't pollute the content graph.
+        let (_t, root) = setup();
+        let ledger = Ledger::new(&root);
+        ledger.ensure_layout().unwrap();
+
+        let forged_id = "cc".repeat(32);
+        let forged = Event {
+            event_kind: "assign".into(),
+            kind: "assign".into(),
+            id: forged_id.clone(),
+            hash: "dd".repeat(32),
+            parents: vec![],
+            ts: "2026-04-18T10:00:00Z".into(),
+            author: "yj".into(),
+            provenance: "test".into(),
+            metadata: BTreeMap::new(),
+        };
+        ledger.write_event(&forged).unwrap();
+
+        let resolver = Resolver::load(&root).unwrap();
+        assert!(
+            !resolver.identities().contains_key(&forged_id),
+            "non-store event must not surface as a resolver identity"
+        );
     }
 
     #[test]

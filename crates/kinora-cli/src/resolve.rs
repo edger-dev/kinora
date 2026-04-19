@@ -328,26 +328,26 @@ mod tests {
     #[test]
     fn fork_report_rendering_has_expected_shape() {
         let heads = vec![
-            Event {
-                kind: "markdown".into(),
-                id: "a".repeat(64),
-                hash: "b".repeat(64),
-                parents: vec![],
-                ts: "2026-04-10T00:00:00Z".into(),
-                author: "yj".into(),
-                provenance: "test".into(),
-                metadata: BTreeMap::new(),
-            },
-            Event {
-                kind: "markdown".into(),
-                id: "a".repeat(64),
-                hash: "c".repeat(64),
-                parents: vec![],
-                ts: "2026-04-12T00:00:00Z".into(),
-                author: "yj".into(),
-                provenance: "test".into(),
-                metadata: BTreeMap::new(),
-            },
+            Event::new_store(
+                "markdown".into(),
+                "a".repeat(64),
+                "b".repeat(64),
+                vec![],
+                "2026-04-10T00:00:00Z".into(),
+                "yj".into(),
+                "test".into(),
+                BTreeMap::new(),
+            ),
+            Event::new_store(
+                "markdown".into(),
+                "a".repeat(64),
+                "c".repeat(64),
+                vec![],
+                "2026-04-12T00:00:00Z".into(),
+                "yj".into(),
+                "test".into(),
+                BTreeMap::new(),
+            ),
         ];
         let lineages = vec!["lllll1".to_string(), "lllll2".to_string()];
         let mut buf = Vec::new();
@@ -366,26 +366,26 @@ mod tests {
     #[test]
     fn all_heads_rendering_lists_each_head() {
         let heads = vec![
-            Event {
-                kind: "markdown".into(),
-                id: "a".repeat(64),
-                hash: "b".repeat(64),
-                parents: vec![],
-                ts: "2026-04-10T00:00:00Z".into(),
-                author: "yj".into(),
-                provenance: "test".into(),
-                metadata: BTreeMap::new(),
-            },
-            Event {
-                kind: "markdown".into(),
-                id: "a".repeat(64),
-                hash: "c".repeat(64),
-                parents: vec![],
-                ts: "2026-04-12T00:00:00Z".into(),
-                author: "yj".into(),
-                provenance: "test".into(),
-                metadata: BTreeMap::new(),
-            },
+            Event::new_store(
+                "markdown".into(),
+                "a".repeat(64),
+                "b".repeat(64),
+                vec![],
+                "2026-04-10T00:00:00Z".into(),
+                "yj".into(),
+                "test".into(),
+                BTreeMap::new(),
+            ),
+            Event::new_store(
+                "markdown".into(),
+                "a".repeat(64),
+                "c".repeat(64),
+                vec![],
+                "2026-04-12T00:00:00Z".into(),
+                "yj".into(),
+                "test".into(),
+                BTreeMap::new(),
+            ),
         ];
         let lineages = vec!["lllll1".to_string(), "lllll2".to_string()];
         let mut buf = Vec::new();

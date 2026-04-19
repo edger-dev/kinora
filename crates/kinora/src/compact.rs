@@ -438,6 +438,39 @@ mod tests {
     }
 
     #[test]
+    fn compact_ignores_non_store_events() {
+        // A hand-forged non-store event in the hot ledger must not appear
+        // in the compacted root. Compact only sees content-track events.
+        let (_t, root) = setup();
+        store_md(&root, b"real", "doc", "2026-04-19T10:00:00Z");
+
+        // Forge a bogus event; if compact didn't filter, it would try to
+        // read its hash from the content store and fail.
+        let forged = Event {
+            event_kind: "assign".into(),
+            kind: "assign".into(),
+            id: "cc".repeat(32),
+            hash: "dd".repeat(32),
+            parents: vec![],
+            ts: "2026-04-19T10:00:00Z".into(),
+            author: "yj".into(),
+            provenance: "test".into(),
+            metadata: BTreeMap::new(),
+        };
+        Ledger::new(&root).write_event(&forged).unwrap();
+
+        let result = compact(&root, "main", params("yj", "2026-04-19T10:00:05Z"))
+            .unwrap();
+        let hash = result.new_version.expect("expected compaction to succeed");
+        let bytes = ContentStore::new(&root).read(&hash).unwrap();
+        let kinograph = RootKinograph::parse(&bytes).unwrap();
+        assert!(
+            kinograph.entries.iter().all(|k| k.id != forged.id),
+            "forged non-store event leaked into root kinograph"
+        );
+    }
+
+    #[test]
     fn compact_with_no_events_and_no_prior_is_no_op() {
         let (_t, root) = setup();
         let result = compact(&root, "main", params("yj", "2026-04-19T10:00:00Z"))
@@ -630,16 +663,16 @@ mod tests {
         // parent — no head exists. Since store_kino's validator rejects
         // self-parents and missing-parents, construct events by hand and
         // feed them to `build_root` directly.
-        let make = |hash: &str, parents: Vec<String>| Event {
-            kind: "markdown".into(),
-            id: "id".into(),
-            hash: hash.into(),
+        let make = |hash: &str, parents: Vec<String>| Event::new_store(
+            "markdown".into(),
+            "id".into(),
+            hash.into(),
             parents,
-            ts: "t".into(),
-            author: "a".into(),
-            provenance: "p".into(),
-            metadata: BTreeMap::new(),
-        };
+            "t".into(),
+            "a".into(),
+            "p".into(),
+            BTreeMap::new(),
+        );
         let a = make(&"aa".repeat(32), vec!["bb".repeat(32)]);
         let b = make(&"bb".repeat(32), vec!["aa".repeat(32)]);
         let err = build_root(&[a, b]).unwrap_err();

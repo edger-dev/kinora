@@ -136,6 +136,7 @@ pub fn store_kino(
     };
 
     let event = Event {
+        event_kind: crate::event::EVENT_KIND_STORE.to_owned(),
         kind: params.kind,
         id,
         hash: hash_hex,
