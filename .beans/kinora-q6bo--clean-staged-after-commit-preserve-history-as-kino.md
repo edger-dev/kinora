@@ -1,11 +1,11 @@
 ---
 # kinora-q6bo
 title: Clean staged after commit; preserve history as kino in 'commits' root
-status: todo
+status: in-progress
 type: feature
 priority: normal
 created_at: 2026-04-19T14:39:21Z
-updated_at: 2026-04-19T16:33:02Z
+updated_at: 2026-04-19T18:16:37Z
 blocked_by:
     - kinora-2t6l
 ---
@@ -96,3 +96,42 @@ All 5 open design questions resolved. Implementation can proceed:
 5. Q5 decided: hardcoded name check in render
 
 Bean is no longer blocked by ambiguity. Still blocked-by kinora-2t6l (rename hot→staged) — though that is completed. Move to `todo` when ready for implementation.
+
+## Plan
+
+Three phases, each TDD cycle (tests → impl → review fix). Complete 1 phase = commit; move on.
+
+### Phase A — config auto-provision
+- Tests in config.rs: commits auto-injected with RootPolicy::Never when absent; user override preserved; serializes back cleanly
+- Impl: 1-line addition in Config::from_styx after the existing inbox auto-provision
+
+### Phase B — archive serialization format
+- New module `kinora::commit_archive`
+- Public API:
+  - `serialize_archive(events: &[Event]) -> Vec<u8>` — first line is header `{"@schema":"kinora-commit-archive-v1"}`, then one event-json per line
+  - `parse_archive(bytes: &[u8]) -> Result<(Header, Vec<Event>), ArchiveError>`
+- Tests: round-trip, empty events, schema header rejection for unknown version
+
+### Phase C — wire it all together
+- commit.rs `commit_root_with_refs` after successful pointer write:
+  - Skip if root_name == "commits"
+  - Collect events consumed by this root commit (those present in this root's rebuild path)
+  - Serialize via Phase B
+  - Write archive blob to ContentStore with kind="commit-archive"
+  - Create AssignEvent with target=archive hash into root="commits"
+  - Delete consumed staged event files (existing prune_staged_events logic needs re-gating — today RootPolicy::Never means "keep forever", new lifecycle means "cleaned via archive")
+- commit_all: ensure "commits" iterates last (sort with commits pulled to end)
+- commit.rs for commits root: consume staged archive-assigns + delete them, skip archive-of-archive creation
+- render.rs: `if root_name == "commits" { continue }`
+- Tests: full end-to-end (commit consumes → archive stored → commits root receives assign → second commit on commits consumes its staged)
+
+### Todos (replacing original)
+
+- [x] Phase A: config auto-provision tests
+- [ ] Phase A: config auto-provision impl
+- [ ] Phase B: commit_archive module tests
+- [ ] Phase B: commit_archive module impl
+- [ ] Phase C: integration tests
+- [ ] Phase C: commit pipeline archive + cleanup + special-case
+- [ ] Phase C: render exclusion
+- [ ] Review pass

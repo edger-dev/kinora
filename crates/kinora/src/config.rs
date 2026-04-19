@@ -171,13 +171,19 @@ impl Config {
 mod tests {
     use super::*;
 
-    fn cfg_with_inbox_default() -> Config {
+    fn cfg_with_auto_provisions() -> Config {
         Config {
             repo_url: "https://github.com/edger-dev/kinora".into(),
-            roots: BTreeMap::from([(
-                "inbox".to_owned(),
-                RootPolicy::MaxAge(DEFAULT_INBOX_POLICY.to_owned()),
-            )]),
+            roots: BTreeMap::from([
+                (
+                    "commits".to_owned(),
+                    RootPolicy::Never,
+                ),
+                (
+                    "inbox".to_owned(),
+                    RootPolicy::MaxAge(DEFAULT_INBOX_POLICY.to_owned()),
+                ),
+            ]),
         }
     }
 
@@ -251,25 +257,26 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
-    fn roundtrip_minimal_config_injects_inbox_default() {
+    fn roundtrip_minimal_config_injects_auto_provision_defaults() {
         let c = Config {
             repo_url: "https://github.com/edger-dev/kinora".into(),
             roots: BTreeMap::new(),
         };
         let s = c.to_styx().unwrap();
         let parsed = Config::from_styx(&s).unwrap();
-        assert_eq!(parsed, cfg_with_inbox_default());
+        assert_eq!(parsed, cfg_with_auto_provisions());
     }
 
     #[test]
-    fn parses_inline_repo_url_with_no_roots_block_auto_provisions_inbox() {
+    fn parses_inline_repo_url_with_no_roots_block_auto_provisions_inbox_and_commits() {
         let c = Config::from_styx("repo-url https://github.com/edger-dev/kinora").unwrap();
         assert_eq!(c.repo_url, "https://github.com/edger-dev/kinora");
         assert_eq!(
             c.roots.get("inbox"),
             Some(&RootPolicy::MaxAge(DEFAULT_INBOX_POLICY.to_owned()))
         );
-        assert_eq!(c.roots.len(), 1);
+        assert_eq!(c.roots.get("commits"), Some(&RootPolicy::Never));
+        assert_eq!(c.roots.len(), 2);
     }
 
     #[test]
@@ -303,11 +310,46 @@ roots {
 }
 "#;
         let c = Config::from_styx(input).unwrap();
-        assert_eq!(c.roots.len(), 2);
+        assert_eq!(c.roots.len(), 3);
         assert_eq!(c.roots.get("rfcs"), Some(&RootPolicy::Never));
         assert_eq!(
             c.roots.get("inbox"),
             Some(&RootPolicy::MaxAge(DEFAULT_INBOX_POLICY.to_owned()))
+        );
+        assert_eq!(c.roots.get("commits"), Some(&RootPolicy::Never));
+    }
+
+    #[test]
+    fn auto_provisions_commits_with_never_policy_when_absent() {
+        let c = Config::from_styx("repo-url https://github.com/edger-dev/kinora").unwrap();
+        assert_eq!(c.roots.get("commits"), Some(&RootPolicy::Never));
+    }
+
+    #[test]
+    fn auto_provisions_commits_when_roots_block_present_but_lacks_commits() {
+        let input = r#"
+repo-url "https://example.com/x.git"
+roots {
+  rfcs { policy "never" }
+}
+"#;
+        let c = Config::from_styx(input).unwrap();
+        assert_eq!(c.roots.get("commits"), Some(&RootPolicy::Never));
+    }
+
+    #[test]
+    fn explicit_commits_policy_is_preserved_not_overridden() {
+        let input = r#"
+repo-url "https://example.com/x.git"
+roots {
+  commits { policy "keep-last-100" }
+}
+"#;
+        let c = Config::from_styx(input).unwrap();
+        assert_eq!(
+            c.roots.get("commits"),
+            Some(&RootPolicy::KeepLastN(100)),
+            "user's explicit commits policy must not be clobbered"
         );
     }
 
@@ -350,6 +392,7 @@ roots {
         let c = Config {
             repo_url: "https://github.com/edger-dev/kinora".into(),
             roots: BTreeMap::from([
+                ("commits".into(), RootPolicy::Never),
                 ("inbox".into(), RootPolicy::MaxAge("30d".into())),
                 ("rfcs".into(), RootPolicy::Never),
                 ("designs".into(), RootPolicy::KeepLastN(10)),
