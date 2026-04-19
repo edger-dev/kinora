@@ -1,8 +1,7 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-
-use std::collections::BTreeMap;
 
 use crate::config::{Config, ConfigError, RootPolicy, DEFAULT_INBOX_POLICY};
 use crate::paths::{config_path, kinora_root, ledger_dir, store_dir};

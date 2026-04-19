@@ -39,6 +39,9 @@ impl RootPolicy {
             return Some(RootPolicy::Never);
         }
         if let Some(rest) = raw.strip_prefix("keep-last-") {
+            if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
             let n: usize = rest.parse().ok()?;
             return Some(RootPolicy::KeepLastN(n));
         }
@@ -46,8 +49,8 @@ impl RootPolicy {
         if digit_end == 0 || digit_end == raw.len() {
             return None;
         }
-        let tail = &raw[digit_end..];
-        if !tail.bytes().all(|b| b.is_ascii_alphabetic()) {
+        let tail = &raw.as_bytes()[digit_end..];
+        if tail.len() != 1 || !b"smhdwy".contains(&tail[0]) {
             return None;
         }
         Some(RootPolicy::MaxAge(raw.to_owned()))
@@ -207,6 +210,10 @@ mod tests {
         assert!(RootPolicy::from_policy_str("30d5h").is_none(), "compound not yet supported");
         assert!(RootPolicy::from_policy_str("keep-last-").is_none(), "no count");
         assert!(RootPolicy::from_policy_str("keep-last-x").is_none(), "non-numeric count");
+        assert!(RootPolicy::from_policy_str("keep-last-+5").is_none(), "signed count");
+        assert!(RootPolicy::from_policy_str("Never").is_none(), "keyword case-sensitive");
+        assert!(RootPolicy::from_policy_str("30D").is_none(), "unit case-sensitive");
+        assert!(RootPolicy::from_policy_str("30qqq").is_none(), "unit not in [smhdwy]");
     }
 
     #[test]
