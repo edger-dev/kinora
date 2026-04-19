@@ -1,10 +1,10 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use kinora::cache_path::CachePath;
 use kinora::config::Config;
-use kinora::ledger::Ledger;
 use kinora::paths::{config_path, kinora_root};
-use kinora::render::{render_for_branch, write_book};
+use kinora::render::{render, write_book};
 use kinora::resolve::Resolver;
 
 use crate::common::{find_repo_root, CliError};
@@ -38,8 +38,8 @@ pub fn run_render(cwd: &Path, args: RenderRunArgs) -> Result<RenderReport, CliEr
     };
 
     let resolver = Resolver::load(&kin_root)?;
-    let branch = current_branch_label(&kin_root)?;
-    let book = render_for_branch(&resolver, &branch)?;
+    let owners = build_owners_map(&kin_root)?;
+    let book = render(&resolver, &owners, "unreferenced")?;
     let page_count = book.pages.len();
     let skipped_count = book.skipped.len();
 
@@ -69,19 +69,22 @@ fn resolve_cache_root(xdg: Option<&str>, home: Option<&str>) -> Result<PathBuf, 
     Err(CliError::CacheHomeUnresolved)
 }
 
-/// Best-effort "branch" label. Without multi-branch support, falls back to
-/// the current lineage shorthash — unique per originating HEAD, so the
-/// single-branch layout doesn't collide with multi-branch output added later.
-fn current_branch_label(kin_root: &Path) -> Result<String, CliError> {
-    match Ledger::new(kin_root).current_lineage()? {
-        Some(sh) => Ok(sh),
-        None => Ok("main".to_owned()),
-    }
+/// Build a map from kino id to the name of the root that owns it.
+///
+/// Scans `.kinora/roots/` pointer files; for each pointer, loads the
+/// referenced root kinograph blob and records every entry id under that
+/// root's name. Kinos that are not owned by any compacted root are left
+/// out — callers should fall back to a default label for them.
+fn build_owners_map(_kin_root: &Path) -> Result<HashMap<String, String>, CliError> {
+    // STUB (ml4t-commit-1): always returns empty. Commit 2 replaces this
+    // with the real pointer-file scan + RootKinograph parse.
+    Ok(HashMap::new())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kinora::compact::{compact, CompactParams};
     use kinora::init::init;
     use kinora::kino::{store_kino, StoreKinoParams};
     use std::collections::BTreeMap;
@@ -91,6 +94,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         init(tmp.path(), "https://github.com/edger-dev/kinora").unwrap();
         tmp
+    }
+
+    fn compact_params() -> CompactParams {
+        CompactParams {
+            author: "yj".into(),
+            provenance: "test".into(),
+            ts: "2026-04-19T10:00:00Z".into(),
+        }
     }
 
     fn params(content: &[u8], name: &str) -> StoreKinoParams {
@@ -197,5 +208,92 @@ mod tests {
         let summary =
             std::fs::read_to_string(cache.path().join("src/SUMMARY.md")).unwrap();
         assert!(summary.starts_with("# Summary"));
+    }
+
+    // ------------------------------------------------------------------
+    // build_owners_map
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn build_owners_map_empty_when_no_roots_dir() {
+        let tmp = repo();
+        let kin = kinora_root(tmp.path());
+        let owners = build_owners_map(&kin).unwrap();
+        assert!(owners.is_empty(), "expected empty map, got: {owners:?}");
+    }
+
+    #[test]
+    fn build_owners_map_maps_entries_to_root_name() {
+        let tmp = repo();
+        let kin = kinora_root(tmp.path());
+
+        let ev1 = store_kino(&kin, params(b"alpha", "alpha")).unwrap();
+        let ev2 = store_kino(&kin, params(b"beta", "beta")).unwrap();
+
+        compact(&kin, "main", compact_params()).unwrap();
+
+        let owners = build_owners_map(&kin).unwrap();
+        assert_eq!(owners.get(&ev1.event.id).map(String::as_str), Some("main"));
+        assert_eq!(owners.get(&ev2.event.id).map(String::as_str), Some("main"));
+    }
+
+    // ------------------------------------------------------------------
+    // End-to-end render grouping
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn render_pure_hot_repo_groups_under_unreferenced() {
+        let tmp = repo();
+        let kin = kinora_root(tmp.path());
+        store_kino(&kin, params(b"# a\n", "alpha")).unwrap();
+        store_kino(&kin, params(b"# b\n", "beta")).unwrap();
+
+        let cache = TempDir::new().unwrap();
+        let args = RenderRunArgs {
+            cache_dir: Some(cache.path().to_string_lossy().into_owned()),
+        };
+        let report = run_render(tmp.path(), args).unwrap();
+        assert_eq!(report.page_count, 2);
+        assert!(cache.path().join("src/unreferenced/index.md").is_file());
+        assert!(!cache.path().join("src/main").exists());
+    }
+
+    #[test]
+    fn render_compacted_main_groups_under_main() {
+        let tmp = repo();
+        let kin = kinora_root(tmp.path());
+        store_kino(&kin, params(b"# a\n", "alpha")).unwrap();
+        store_kino(&kin, params(b"# b\n", "beta")).unwrap();
+        compact(&kin, "main", compact_params()).unwrap();
+
+        let cache = TempDir::new().unwrap();
+        let args = RenderRunArgs {
+            cache_dir: Some(cache.path().to_string_lossy().into_owned()),
+        };
+        let report = run_render(tmp.path(), args).unwrap();
+        assert_eq!(report.page_count, 2);
+        assert!(cache.path().join("src/main/index.md").is_file());
+        assert!(!cache.path().join("src/unreferenced").exists());
+    }
+
+    #[test]
+    fn render_mixed_repo_splits_between_main_and_unreferenced() {
+        let tmp = repo();
+        let kin = kinora_root(tmp.path());
+        store_kino(&kin, params(b"# a\n", "alpha")).unwrap();
+        store_kino(&kin, params(b"# b\n", "beta")).unwrap();
+        compact(&kin, "main", compact_params()).unwrap();
+
+        // Add a post-compact kino that isn't owned by any root yet.
+        store_kino(&kin, params(b"# c\n", "gamma")).unwrap();
+
+        let cache = TempDir::new().unwrap();
+        let args = RenderRunArgs {
+            cache_dir: Some(cache.path().to_string_lossy().into_owned()),
+        };
+        let report = run_render(tmp.path(), args).unwrap();
+        assert_eq!(report.page_count, 3);
+        assert!(cache.path().join("src/main/index.md").is_file());
+        assert!(cache.path().join("src/unreferenced/index.md").is_file());
     }
 }

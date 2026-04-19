@@ -1,11 +1,11 @@
 ---
 # kinora-ml4t
 title: 'Render: revisit branch labels under hot-ledger layout'
-status: todo
+status: in-progress
 type: task
 priority: low
 created_at: 2026-04-19T06:23:45Z
-updated_at: 2026-04-19T07:47:49Z
+updated_at: 2026-04-19T08:14:21Z
 parent: kinora-w7w0
 ---
 
@@ -72,3 +72,38 @@ This bean can land in phase 2 — it doesn't block on kinora-hxmw. The `unrefere
 - [ ] Test: pure-hot repo with no compact → all pages under `unreferenced/`
 - [ ] Test: single `main` root post-compact → all pages under `main/`
 - [ ] Test: mixed (some compacted, some not) → correct split between root name and `unreferenced/`
+
+## Plan
+
+### Library changes (`crates/kinora/src/render.rs`)
+
+1. Rename `render_for_branch(&Resolver, branch)` → `render(&Resolver, labels: &HashMap<String, String>, default_label: &str)`. Every kino id the resolver knows about gets its group label from `labels`; missing ids fall back to `default_label`.
+2. Rename `RenderedPage.branch` → `RenderedPage.group` (branch is misleading under hot-ledger).
+3. Rename internal helpers: `group_by_branch` → `group_by_label`, `branch_index_md` → `group_index_md`.
+4. Source marker: "Rendered from branch `X`" → "Rendered from `X`".
+5. `SkipReason::MultipleHeads` display: drop "branch tiebreaker" wording.
+6. Skip `kind == "root"` kinos entirely from render output — roots are internal bookkeeping, not user content.
+
+### CLI changes (`crates/kinora-cli/src/render.rs`)
+
+1. Remove `current_branch_label` (reads legacy `.kinora/HEAD`).
+2. Add `build_owners_map(kin_root) -> Result<HashMap<String, String>, CliError>`:
+   - List pointer files under `.kinora/roots/` (each file's name is the root name; contents are the 64-hex version hash).
+   - For each pointer, load the root blob via `ContentStore::read` and parse as `RootKinograph`.
+   - For each entry id, insert `(id → root_name)` into the map.
+3. Call site: `let owners = build_owners_map(&kin_root)?; let book = render(&resolver, &owners, "unreferenced")?;`
+
+### Tests
+
+- Library: update existing tests that call `render_for_branch(..., "main")` → build a labels map covering all stored ids or use the `default_label` fallback. Keep behavioural coverage.
+- Library new: `render_groups_pages_by_label_map`, `render_falls_back_to_default_label_for_unmapped_id`, `render_skips_root_kind_kinos`.
+- CLI new: `build_owners_map_returns_empty_when_no_roots_dir`, `build_owners_map_maps_entries_to_root_name`, and three end-to-end render tests matching the bean's acceptance:
+  - pure-hot repo with no compact → all pages under `unreferenced/`
+  - single `main` root post-compact → all pages under `main/`
+  - mixed (some compacted, some hot-only) → correct split
+
+### Commit plan
+
+1. **Tests commit**: stub the new library + CLI signatures (return empty), update every existing test to the new API, add the new tests. Tests compile; failures are assertion failures, not compile errors (per CLAUDE.md TDD rule).
+2. **Implementation commit**: replace stubs with real logic (label lookup, root-kind skip, `build_owners_map`). All tests pass; zero warnings.
+3. **Review commit** (if needed): fixes from subagent review.

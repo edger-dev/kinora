@@ -1,14 +1,16 @@
 //! Render kinos and kinographs into an in-memory mdbook-shaped `Book`.
 //!
-//! The library layer has no knowledge of disk layout, branches, or git. It
-//! takes a loaded `Resolver` plus a branch label, and returns a deterministic
-//! list of rendered pages. The CLI layer pairs this with disk writes.
+//! The library layer has no knowledge of disk layout or git. It takes a
+//! loaded `Resolver` plus a per-kino group-label map, and returns a
+//! deterministic list of rendered pages. The CLI layer pairs this with
+//! disk writes and builds the label map from `.kinora/roots/` pointers.
 //!
 //! Kind dispatch (MVP):
 //! - `markdown` — content is passed through verbatim
 //! - `kinograph` — composed via `Kinograph::render`
 //! - `text` — wrapped in a fenced `text` code block
 //! - `binary` — replaced with a placeholder note
+//! - `root` — skipped entirely (roots are internal bookkeeping)
 //! - other kinds — placeholder note naming the kind
 //!
 //! `kino://<64hex-id>[/]` occurrences in the body are rewritten to relative
@@ -29,7 +31,10 @@ use crate::resolve::{ResolveError, Resolver};
 pub struct RenderedPage {
     pub id: String,
     pub slug: String,
-    pub branch: String,
+    /// Group label under which this page sits in the rendered book (e.g.
+    /// a root-kinograph name like `main`, `rfcs`, or the fallback for
+    /// kinos not yet compacted into any root).
+    pub group: String,
     pub title: String,
     pub kind: String,
     pub body: String,
@@ -52,7 +57,7 @@ impl std::fmt::Display for SkipReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SkipReason::MultipleHeads => {
-                write!(f, "multiple heads (fork unresolved by branch tiebreaker)")
+                write!(f, "multiple heads (fork unresolved)")
             }
         }
     }
@@ -110,16 +115,19 @@ impl From<std::string::FromUtf8Error> for RenderError {
     }
 }
 
-/// Render every identity's current head into a `Book` labelled by `branch`.
+/// Render every identity's current head into a `Book`, stamping each page
+/// with its group label from `labels` (or `default_label` if absent).
 ///
 /// Pages are sorted by `(name-or-empty, id)` so the output is stable across
 /// runs. Identities with no head are skipped silently (shouldn't happen once
-/// the ledger is well-formed, but it keeps the renderer robust).
-pub fn render_for_branch(
+/// the ledger is well-formed, but it keeps the renderer robust). Kinos of
+/// kind `root` are skipped entirely — they're internal bookkeeping (the
+/// root kinograph versions themselves) and should not appear as pages.
+pub fn render(
     resolver: &Resolver,
-    branch: impl Into<String>,
+    labels: &HashMap<String, String>,
+    default_label: &str,
 ) -> Result<Book, RenderError> {
-    let branch = branch.into();
     let mut entries: Vec<(String, String, String, String)> = Vec::new(); // (name, id, kind, body)
     let mut skipped: Vec<SkippedIdentity> = Vec::new();
 
@@ -139,6 +147,7 @@ pub fn render_for_branch(
             Err(e) => return Err(RenderError::Resolve(e)),
         };
         let kind = resolved.head.kind.clone();
+        // STUB (ml4t-commit-1): root-kind skip not yet implemented.
         let name = resolved
             .head
             .metadata
@@ -163,10 +172,13 @@ pub fn render_for_branch(
             } else {
                 name.clone()
             };
+            // STUB (ml4t-commit-1): always uses default_label, ignoring map.
+            let _ = labels;
+            let group = default_label.to_owned();
             RenderedPage {
                 id,
                 slug,
-                branch: branch.clone(),
+                group,
                 title,
                 kind,
                 body,
@@ -301,9 +313,9 @@ fn rewrite_kino_urls(body: &str, slug_by_id: &HashMap<String, String>) -> String
 /// <cache_root>/
 ///   book.toml
 ///   src/
-///     SUMMARY.md               # grouped by branch
-///     <branch>/
-///       index.md               # per-branch landing page
+///     SUMMARY.md               # grouped by page.group
+///     <group>/
+///       index.md               # per-group landing page
 ///       <slug>.md              # one per rendered page
 /// ```
 ///
@@ -321,18 +333,18 @@ pub fn write_book(cache_root: &Path, title: &str, book: &Book) -> Result<(), Ren
 
     fs::write(cache_root.join("book.toml"), book_toml(title))?;
 
-    let by_branch = group_by_branch(book);
-    for (branch, pages) in &by_branch {
-        let branch_dir = src_dir.join(branch);
-        fs::create_dir_all(&branch_dir)?;
-        fs::write(branch_dir.join("index.md"), branch_index_md(branch, pages))?;
+    let by_group = group_by_label(book);
+    for (group, pages) in &by_group {
+        let group_dir = src_dir.join(group);
+        fs::create_dir_all(&group_dir)?;
+        fs::write(group_dir.join("index.md"), group_index_md(group, pages))?;
         for page in pages {
             let body = page_with_source_marker(page);
-            fs::write(branch_dir.join(format!("{}.md", page.slug)), body)?;
+            fs::write(group_dir.join(format!("{}.md", page.slug)), body)?;
         }
     }
 
-    fs::write(src_dir.join("SUMMARY.md"), summary_md(&by_branch))?;
+    fs::write(src_dir.join("SUMMARY.md"), summary_md(&by_group))?;
     Ok(())
 }
 
@@ -353,30 +365,30 @@ fn book_toml(title: &str) -> String {
     )
 }
 
-fn group_by_branch(book: &Book) -> BTreeMap<String, Vec<&RenderedPage>> {
+fn group_by_label(book: &Book) -> BTreeMap<String, Vec<&RenderedPage>> {
     let mut map: BTreeMap<String, Vec<&RenderedPage>> = BTreeMap::new();
     for page in &book.pages {
-        map.entry(page.branch.clone()).or_default().push(page);
+        map.entry(page.group.clone()).or_default().push(page);
     }
     map
 }
 
-fn summary_md(by_branch: &BTreeMap<String, Vec<&RenderedPage>>) -> String {
+fn summary_md(by_group: &BTreeMap<String, Vec<&RenderedPage>>) -> String {
     let mut out = String::from("# Summary\n\n");
-    for (branch, pages) in by_branch {
-        out.push_str(&format!("- [{branch}]({branch}/index.md)\n"));
+    for (group, pages) in by_group {
+        out.push_str(&format!("- [{group}]({group}/index.md)\n"));
         for page in pages {
             out.push_str(&format!(
                 "  - [{}]({}/{}.md)\n",
-                page.title, branch, page.slug,
+                page.title, group, page.slug,
             ));
         }
     }
     out
 }
 
-fn branch_index_md(branch: &str, pages: &[&RenderedPage]) -> String {
-    let mut out = format!("# {branch}\n\n");
+fn group_index_md(group: &str, pages: &[&RenderedPage]) -> String {
+    let mut out = format!("# {group}\n\n");
     if pages.is_empty() {
         out.push_str("_(no pages)_\n");
         return out;
@@ -394,8 +406,8 @@ fn page_with_source_marker(page: &RenderedPage) -> String {
         out.push('\n');
     }
     out.push_str(&format!(
-        "\n---\n\n*Rendered from branch `{}` (id `{}`)*\n",
-        page.branch,
+        "\n---\n\n*Rendered from `{}` (id `{}`)*\n",
+        page.group,
         short_id(&page.id),
     ));
     out
@@ -430,15 +442,22 @@ mod tests {
         }
     }
 
+    /// Convenience for tests that don't care about per-id grouping — every
+    /// kino lands under `default_label`.
+    fn render_all_under(resolver: &Resolver, default_label: &str) -> Result<Book, RenderError> {
+        let labels = HashMap::new();
+        render(resolver, &labels, default_label)
+    }
+
     #[test]
     fn renders_single_markdown_kino() {
         let (_t, root) = setup();
         store_kino(&root, params("markdown", b"# Hello\n\nBody text.", "greet")).unwrap();
         let resolver = Resolver::load(&root).unwrap();
-        let book = render_for_branch(&resolver, "main").unwrap();
+        let book = render_all_under(&resolver, "main").unwrap();
         assert_eq!(book.pages.len(), 1);
         let page = &book.pages[0];
-        assert_eq!(page.branch, "main");
+        assert_eq!(page.group, "main");
         assert_eq!(page.kind, "markdown");
         assert_eq!(page.title, "greet");
         assert!(page.slug.starts_with("greet-"));
@@ -452,7 +471,7 @@ mod tests {
         store_kino(&root, params("markdown", b"a", "alpha")).unwrap();
         store_kino(&root, params("markdown", b"c", "charlie")).unwrap();
         let resolver = Resolver::load(&root).unwrap();
-        let book = render_for_branch(&resolver, "main").unwrap();
+        let book = render_all_under(&resolver, "main").unwrap();
         let titles: Vec<_> = book.pages.iter().map(|p| p.title.as_str()).collect();
         assert_eq!(titles, vec!["alpha", "beta", "charlie"]);
     }
@@ -462,7 +481,7 @@ mod tests {
         let (_t, root) = setup();
         store_kino(&root, params("text", b"plain body", "note")).unwrap();
         let resolver = Resolver::load(&root).unwrap();
-        let book = render_for_branch(&resolver, "main").unwrap();
+        let book = render_all_under(&resolver, "main").unwrap();
         assert!(book.pages[0].body.starts_with("```text\n"));
         assert!(book.pages[0].body.contains("plain body"));
         assert!(book.pages[0].body.trim_end().ends_with("```"));
@@ -473,7 +492,7 @@ mod tests {
         let (_t, root) = setup();
         store_kino(&root, params("binary", b"\x00\x01\x02", "blob")).unwrap();
         let resolver = Resolver::load(&root).unwrap();
-        let book = render_for_branch(&resolver, "main").unwrap();
+        let book = render_all_under(&resolver, "main").unwrap();
         assert!(
             book.pages[0].body.contains("opaque binary"),
             "got body: {}",
@@ -486,7 +505,7 @@ mod tests {
         let (_t, root) = setup();
         store_kino(&root, params("mystery::format", b"x", "m")).unwrap();
         let resolver = Resolver::load(&root).unwrap();
-        let book = render_for_branch(&resolver, "main").unwrap();
+        let book = render_all_under(&resolver, "main").unwrap();
         assert!(
             book.pages[0].body.contains("unrenderable kind"),
             "got body: {}",
@@ -509,7 +528,7 @@ mod tests {
         .unwrap();
 
         let resolver = Resolver::load(&root).unwrap();
-        let book = render_for_branch(&resolver, "main").unwrap();
+        let book = render_all_under(&resolver, "main").unwrap();
         let kg_page = book.pages.iter().find(|p| p.kind == "kinograph").unwrap();
         assert!(kg_page.body.contains("alpha"));
         assert!(kg_page.body.contains("bravo"));
@@ -530,7 +549,7 @@ mod tests {
         .unwrap();
 
         let resolver = Resolver::load(&root).unwrap();
-        let book = render_for_branch(&resolver, "main").unwrap();
+        let book = render_all_under(&resolver, "main").unwrap();
         let referrer_page = book.pages.iter().find(|p| p.title == "referrer").unwrap();
         let target_slug = &book.pages.iter().find(|p| p.title == "target").unwrap().slug;
         assert!(
@@ -553,7 +572,7 @@ mod tests {
         store_kino(&root, params("markdown", body.as_bytes(), "x")).unwrap();
 
         let resolver = Resolver::load(&root).unwrap();
-        let book = render_for_branch(&resolver, "main").unwrap();
+        let book = render_all_under(&resolver, "main").unwrap();
         assert!(book.pages[0].body.contains(&format!("kino://{bogus}/")));
     }
 
@@ -565,7 +584,7 @@ mod tests {
         store_kino(&root, params("markdown", body.as_bytes(), "ref")).unwrap();
 
         let resolver = Resolver::load(&root).unwrap();
-        let book = render_for_branch(&resolver, "main").unwrap();
+        let book = render_all_under(&resolver, "main").unwrap();
         let referrer = book.pages.iter().find(|p| p.title == "ref").unwrap();
         assert!(!referrer.body.contains("kino://"));
     }
@@ -574,18 +593,70 @@ mod tests {
     fn empty_repo_yields_empty_book() {
         let (_t, root) = setup();
         let resolver = Resolver::load(&root).unwrap();
-        let book = render_for_branch(&resolver, "main").unwrap();
+        let book = render_all_under(&resolver, "main").unwrap();
         assert!(book.pages.is_empty());
     }
 
     #[test]
-    fn branch_label_propagates_to_every_page() {
+    fn default_label_propagates_to_every_page_when_map_is_empty() {
         let (_t, root) = setup();
         store_kino(&root, params("markdown", b"x", "a")).unwrap();
         store_kino(&root, params("markdown", b"y", "b")).unwrap();
         let resolver = Resolver::load(&root).unwrap();
-        let book = render_for_branch(&resolver, "feature/foo").unwrap();
-        assert!(book.pages.iter().all(|p| p.branch == "feature/foo"));
+        let book = render_all_under(&resolver, "feature/foo").unwrap();
+        assert!(book.pages.iter().all(|p| p.group == "feature/foo"));
+    }
+
+    #[test]
+    fn render_uses_label_from_map_when_id_is_present() {
+        let (_t, root) = setup();
+        let a = store_kino(&root, params("markdown", b"x", "a")).unwrap();
+        let b = store_kino(&root, params("markdown", b"y", "b")).unwrap();
+        let mut labels = HashMap::new();
+        labels.insert(a.event.id.clone(), "alpha-root".into());
+        labels.insert(b.event.id.clone(), "beta-root".into());
+        let resolver = Resolver::load(&root).unwrap();
+        let book = render(&resolver, &labels, "unreferenced").unwrap();
+        let by_id: HashMap<_, _> =
+            book.pages.iter().map(|p| (p.id.as_str(), p.group.as_str())).collect();
+        assert_eq!(by_id.get(a.event.id.as_str()), Some(&"alpha-root"));
+        assert_eq!(by_id.get(b.event.id.as_str()), Some(&"beta-root"));
+    }
+
+    #[test]
+    fn render_falls_back_to_default_label_for_unmapped_id() {
+        let (_t, root) = setup();
+        let mapped = store_kino(&root, params("markdown", b"x", "mapped")).unwrap();
+        let unmapped = store_kino(&root, params("markdown", b"y", "floating")).unwrap();
+        let mut labels = HashMap::new();
+        labels.insert(mapped.event.id.clone(), "main".into());
+        let resolver = Resolver::load(&root).unwrap();
+        let book = render(&resolver, &labels, "unreferenced").unwrap();
+        let by_id: HashMap<_, _> =
+            book.pages.iter().map(|p| (p.id.as_str(), p.group.as_str())).collect();
+        assert_eq!(by_id.get(mapped.event.id.as_str()), Some(&"main"));
+        assert_eq!(by_id.get(unmapped.event.id.as_str()), Some(&"unreferenced"));
+    }
+
+    #[test]
+    fn render_skips_root_kind_kinos() {
+        // A `root` kino represents a compacted root-kinograph blob. Those
+        // shouldn't appear as rendered pages — only the leaves they enumerate.
+        let (_t, root) = setup();
+        store_kino(&root, params("markdown", b"body", "leaf")).unwrap();
+        store_kino(
+            &root,
+            params("root", b"entries (\n)\n", "main-root"),
+        )
+        .unwrap();
+
+        let resolver = Resolver::load(&root).unwrap();
+        let book = render_all_under(&resolver, "main").unwrap();
+
+        let kinds: Vec<_> = book.pages.iter().map(|p| p.kind.as_str()).collect();
+        assert!(!kinds.contains(&"root"), "root-kind page leaked: {kinds:?}");
+        assert_eq!(book.pages.len(), 1);
+        assert_eq!(book.pages[0].title, "leaf");
     }
 
     #[test]
@@ -596,7 +667,7 @@ mod tests {
         store_kino(&root, params("markdown", b"a", "dup")).unwrap();
         store_kino(&root, params("markdown", b"b", "dup")).unwrap();
         let resolver = Resolver::load(&root).unwrap();
-        let book = render_for_branch(&resolver, "main").unwrap();
+        let book = render_all_under(&resolver, "main").unwrap();
         let slugs: std::collections::HashSet<_> =
             book.pages.iter().map(|p| p.slug.as_str()).collect();
         assert_eq!(slugs.len(), book.pages.len(), "slugs collided: {book:?}");
@@ -608,7 +679,7 @@ mod tests {
         store_kino(&root, params("markdown", b"# Alpha\n", "alpha")).unwrap();
         store_kino(&root, params("markdown", b"# Beta\n", "beta")).unwrap();
         let resolver = Resolver::load(&root).unwrap();
-        let book = render_for_branch(&resolver, "main").unwrap();
+        let book = render_all_under(&resolver, "main").unwrap();
 
         let cache = TempDir::new().unwrap();
         write_book(cache.path(), "My Book", &book).unwrap();
@@ -627,7 +698,7 @@ mod tests {
             assert!(path.is_file(), "missing page: {path:?}");
             let contents = std::fs::read_to_string(&path).unwrap();
             assert!(
-                contents.contains("Rendered from branch `main`"),
+                contents.contains("Rendered from `main`"),
                 "expected source marker; got: {contents}"
             );
         }
@@ -641,7 +712,7 @@ mod tests {
 
         // First render.
         let resolver = Resolver::load(&root).unwrap();
-        let book = render_for_branch(&resolver, "main").unwrap();
+        let book = render_all_under(&resolver, "main").unwrap();
         write_book(cache.path(), "t", &book).unwrap();
         let stale_path = cache.path().join("src/main/stale-page.md");
         std::fs::write(&stale_path, "stale").unwrap();
@@ -649,7 +720,7 @@ mod tests {
 
         // Second render — should wipe stale file.
         let resolver = Resolver::load(&root).unwrap();
-        let book = render_for_branch(&resolver, "main").unwrap();
+        let book = render_all_under(&resolver, "main").unwrap();
         write_book(cache.path(), "t", &book).unwrap();
         assert!(!stale_path.exists(), "stale file survived rebuild");
     }
@@ -680,7 +751,7 @@ mod tests {
                 RenderedPage {
                     id: "a".repeat(64),
                     slug: "alpha-aaaaaaaa".into(),
-                    branch: "zeta".into(),
+                    group: "zeta".into(),
                     title: "Alpha".into(),
                     kind: "markdown".into(),
                     body: "x".into(),
@@ -688,7 +759,7 @@ mod tests {
                 RenderedPage {
                     id: "b".repeat(64),
                     slug: "beta-bbbbbbbb".into(),
-                    branch: "main".into(),
+                    group: "main".into(),
                     title: "Beta".into(),
                     kind: "markdown".into(),
                     body: "y".into(),
@@ -729,7 +800,7 @@ mod tests {
         store_kino(&root, params("markdown", b"ok", "clean")).unwrap();
 
         let resolver = Resolver::load(&root).unwrap();
-        let book = render_for_branch(&resolver, "main").unwrap();
+        let book = render_all_under(&resolver, "main").unwrap();
 
         let titles: Vec<_> = book.pages.iter().map(|p| p.title.as_str()).collect();
         assert!(!titles.contains(&"forked"), "forked should be skipped: {titles:?}");
