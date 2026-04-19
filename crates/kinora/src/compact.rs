@@ -305,16 +305,19 @@ impl ExternalRefs {
         Ok(Self { by_target: out })
     }
 
-    /// Versions (content hashes) referenced by any root other than
-    /// `self_root`. Keys are the raw `version` strings, matching how
-    /// `RootEntry::version` is stored. Self-references (a root
-    /// composition pointing at a kino it also owns) don't need
-    /// cross-root protection — explicit pinning already covers that.
-    fn implicit_pinned_versions(&self, self_root: &str) -> BTreeSet<String> {
+    /// `(id, version)` pairs referenced by any root other than
+    /// `self_root`. Self-references don't need cross-root protection —
+    /// explicit pinning already covers that case.
+    ///
+    /// Keyed on the pair (not just version) so two kinos that happen to
+    /// share an identical content hash can't cross-contaminate each
+    /// other's protection: only the exact `(id, version)` combo a
+    /// referencing kinograph names is implicitly pinned.
+    fn implicit_pinned_versions(&self, self_root: &str) -> BTreeSet<(String, String)> {
         self.by_target
             .iter()
             .filter(|(_, sources)| sources.iter().any(|s| s != self_root))
-            .map(|((_, v), _)| v.clone())
+            .map(|((id, v), _)| (id.clone(), v.clone()))
             .collect()
     }
 
@@ -786,7 +789,7 @@ fn apply_root_entry_gc(
     events: &[Event],
     policy: &RootPolicy,
     now: &str,
-    implicit_pinned: &BTreeSet<String>,
+    implicit_pinned: &BTreeSet<(String, String)>,
     refs: &ExternalRefs,
 ) -> Result<BTreeMap<String, usize>, CompactError> {
     let mut retained: BTreeMap<String, usize> = BTreeMap::new();
@@ -818,8 +821,9 @@ fn apply_root_entry_gc(
         if !old {
             return true;
         }
-        if implicit_pinned.contains(&entry.version) {
-            implicit_hits.push((entry.id.clone(), entry.version.clone()));
+        let key = (entry.id.clone(), entry.version.clone());
+        if implicit_pinned.contains(&key) {
+            implicit_hits.push(key);
             return true;
         }
         false
@@ -871,24 +875,28 @@ fn prune_hot_events(
     root: &RootKinograph,
     policy: &RootPolicy,
     now: &str,
-    implicit_pinned: &BTreeSet<String>,
+    implicit_pinned: &BTreeSet<(String, String)>,
 ) -> Result<(), CompactError> {
     if matches!(policy, RootPolicy::Never) {
         return Ok(());
     }
 
-    // Pinned versions (content hashes) — these store events must survive.
-    // Includes explicit `pin: true` entries *and* versions implicitly
-    // pinned by a cross-root composition reference.
-    let mut pinned_versions: BTreeSet<&str> = root
+    // Explicitly pinned versions from this root's kinograph (content
+    // hashes). Cross-root implicit pins are handled separately below
+    // because they need `(id, version)` matching — two kinos with
+    // colliding content hashes should not cross-contaminate protection.
+    let pinned_versions: BTreeSet<&str> = root
         .entries
         .iter()
         .filter(|e| e.pin)
         .map(|e| e.version.as_str())
         .collect();
-    for v in implicit_pinned {
-        pinned_versions.insert(v.as_str());
-    }
+
+    // Implicit pin check: a store event is cross-root-protected only
+    // when `(id, hash)` matches a ref target exactly.
+    let is_implicit_pinned = |id: &str, version: &str| -> bool {
+        implicit_pinned.contains(&(id.to_owned(), version.to_owned()))
+    };
 
     // Recompute live-assign routing to find each store event's owning root.
     let live_assigns = collect_live_assigns(events)?;
@@ -926,10 +934,14 @@ fn prune_hot_events(
             };
             let now_ts = parse_ts(now)?;
             let cutoff = now_ts - max_age_s;
-            // Store events: drop if older than cutoff AND not pinned.
+            // Store events: drop if older than cutoff AND not pinned
+            // (explicit or cross-root implicit).
             for group in owned_stores_by_id.values() {
                 for e in group {
                     if pinned_versions.contains(e.hash.as_str()) {
+                        continue;
+                    }
+                    if is_implicit_pinned(&e.id, &e.hash) {
                         continue;
                     }
                     let Ok(ts) = parse_ts(&e.ts) else { continue };
@@ -959,6 +971,9 @@ fn prune_hot_events(
                         continue;
                     }
                     if pinned_versions.contains(e.hash.as_str()) {
+                        continue;
+                    }
+                    if is_implicit_pinned(&e.id, &e.hash) {
                         continue;
                     }
                     drop_hashes.insert(e.event_hash()?);
@@ -2486,5 +2501,110 @@ roots {
         let b_res = compact_root(&root, "rb", params("yj", "2026-04-19T12:00:00Z")).unwrap();
         assert!(a_res.new_version.is_some());
         assert!(b_res.new_version.is_some());
+    }
+
+    #[test]
+    fn compact_all_snapshot_taken_at_batch_start_protects_across_roots() {
+        // Verifies that compact_all computes its ExternalRefs snapshot
+        // once and passes it to every per-root compact — even the root
+        // whose own compaction bumps another root's pointer.
+        let (_t, root) = setup();
+        write_config(
+            &root,
+            r#"repo-url "https://example.com/x.git"
+roots {
+  rfcs { policy "never" }
+  inbox-b { policy "30d" }
+}
+"#,
+        );
+        let x = store_md(&root, b"x body", "x", "2026-03-10T10:00:00Z");
+        write_assign_for(&root, &x.id, "inbox-b", vec![], "2026-03-10T10:00:01Z");
+        let kg = store_kinograph(
+            &root,
+            vec![KinographEntry {
+                id: x.id.clone(),
+                name: String::new(),
+                pin: x.hash.clone(),
+                note: String::new(),
+            }],
+            "my-list",
+            "2026-04-10T10:00:00Z",
+        );
+        write_assign_for(&root, &kg.id, "rfcs", vec![], "2026-04-10T10:00:01Z");
+
+        // Pre-compact rfcs once so its root pointer names the kg
+        // kinograph; otherwise the batch snapshot wouldn't yet see the
+        // reference.
+        compact_root(&root, "rfcs", params("yj", "2026-04-11T10:00:00Z")).unwrap();
+
+        let entries = compact_all(&root, params("yj", "2026-04-19T12:00:00Z")).unwrap();
+        let by_name: std::collections::HashMap<_, _> = entries.into_iter().collect();
+        let b_res = by_name["inbox-b"].as_ref().unwrap();
+        let b_ids = root_ids(&root, &b_res.new_version.as_ref().unwrap().clone());
+        assert!(
+            b_ids.contains(&x.id),
+            "compact_all must propagate cross-root protection: {b_ids:?}"
+        );
+        assert_eq!(
+            b_res.retained_by_cross_root.get("rfcs").copied(),
+            Some(1),
+            "retention report names rfcs as the protector"
+        );
+    }
+
+    #[test]
+    fn overlapping_refs_from_two_roots_both_count_in_retention() {
+        // A single entry in root C is referenced by kinographs in both
+        // root A and root B. The retention report accumulates a count
+        // per referencing root — so the same entry shows as retained by
+        // both A (1) and B (1), and the total is 2, not 1.
+        let (_t, root) = setup();
+        write_config(
+            &root,
+            r#"repo-url "https://example.com/x.git"
+roots {
+  ra { policy "never" }
+  rb { policy "never" }
+  rc { policy "30d" }
+}
+"#,
+        );
+        let x = store_md(&root, b"x body", "x", "2026-03-10T10:00:00Z");
+        write_assign_for(&root, &x.id, "rc", vec![], "2026-03-10T10:00:01Z");
+        // Distinct note fields keep the two kinographs' byte content
+        // apart, so they hash to different kino ids (otherwise the
+        // assign graph would see the same kino pointed at two roots).
+        let kg_a = store_kinograph(
+            &root,
+            vec![KinographEntry {
+                id: x.id.clone(),
+                name: String::new(),
+                pin: x.hash.clone(),
+                note: "ra-list".into(),
+            }],
+            "kg-a",
+            "2026-04-10T10:00:00Z",
+        );
+        write_assign_for(&root, &kg_a.id, "ra", vec![], "2026-04-10T10:00:01Z");
+        let kg_b = store_kinograph(
+            &root,
+            vec![KinographEntry {
+                id: x.id.clone(),
+                name: String::new(),
+                pin: x.hash.clone(),
+                note: "rb-list".into(),
+            }],
+            "kg-b",
+            "2026-04-10T10:00:02Z",
+        );
+        write_assign_for(&root, &kg_b.id, "rb", vec![], "2026-04-10T10:00:03Z");
+
+        compact_root(&root, "ra", params("yj", "2026-04-11T10:00:00Z")).unwrap();
+        compact_root(&root, "rb", params("yj", "2026-04-11T10:00:00Z")).unwrap();
+        let c_res =
+            compact_root(&root, "rc", params("yj", "2026-04-19T12:00:00Z")).unwrap();
+        assert_eq!(c_res.retained_by_cross_root.get("ra").copied(), Some(1));
+        assert_eq!(c_res.retained_by_cross_root.get("rb").copied(), Some(1));
     }
 }
