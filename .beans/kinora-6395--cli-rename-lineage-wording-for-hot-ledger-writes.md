@@ -1,11 +1,11 @@
 ---
 # kinora-6395
 title: 'CLI: rename `lineage=…` wording for hot-ledger writes'
-status: todo
+status: in-progress
 type: task
 priority: low
 created_at: 2026-04-19T06:23:57Z
-updated_at: 2026-04-19T06:24:00Z
+updated_at: 2026-04-19T07:19:44Z
 parent: kinora-w7w0
 ---
 
@@ -28,6 +28,6 @@ Observed while completing kinora-ve9g.
 
 ## Acceptance
 
-- [ ] CLI print updated
-- [ ] Integration/unit test asserts the new wording
-- [ ] Docs/README reflects the new phrasing if it appears anywhere
+- [x] CLI print updated
+- [x] Integration/unit test asserts the new wording
+- [x] Docs/README reflects the new phrasing if it appears anywhere (README/docs checked — no occurrences)

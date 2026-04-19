@@ -90,13 +90,16 @@ pub struct StoreKinoParams {
 #[derive(Debug)]
 pub struct StoredKino {
     pub event: Event,
-    /// Shorthash of the event hash (first 8 hex chars). The "lineage"
-    /// terminology is retained for CLI back-compat — under the hot-ledger
-    /// layout (kinora-xi21) each event lives in its own file, so per-event
-    /// and per-lineage identity coincide.
+    /// Shorthash of the event hash (first 8 hex chars). Under the hot-ledger
+    /// layout (kinora-xi21) every event lives in its own file keyed by the
+    /// event hash, so this is really the event shorthash. The field name is
+    /// kept through one release for programmatic back-compat (kinora-6395);
+    /// the CLI no longer surfaces the "lineage" wording.
     pub lineage: String,
     /// True iff this event's hot-ledger file did not already exist — i.e.
     /// this call introduced a new event. Idempotent re-stores return false.
+    /// Retained under the `was_new_lineage` name for back-compat with
+    /// programmatic callers; semantically now "was a new event".
     pub was_new_lineage: bool,
 }
 

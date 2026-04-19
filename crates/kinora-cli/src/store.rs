@@ -74,6 +74,25 @@ pub fn run_store(cwd: &Path, args: StoreRunArgs) -> Result<StoredKino, CliError>
     Ok(stored)
 }
 
+/// Format the one-line human summary printed after a successful `kinora
+/// store`. Under the hot-ledger layout each event lives in its own file
+/// keyed by the event hash, so `event=<shorthash>` is the precise wording;
+/// the prior "lineage" terminology is a carryover from the per-lineage
+/// ledger layout and has been retired from the UI. The `StoredKino.lineage`
+/// field is kept under that name for one release so programmatic callers
+/// aren't broken — see kinora-6395.
+pub fn format_store_summary(stored: &StoredKino) -> String {
+    let suffix = if stored.was_new_lineage { " (new event)" } else { "" };
+    format!(
+        "stored kind={} id={} hash={} event={}{}",
+        stored.event.kind,
+        stored.event.id,
+        stored.event.hash,
+        stored.lineage,
+        suffix,
+    )
+}
+
 fn read_content(path: Option<&str>) -> Result<Vec<u8>, CliError> {
     match path {
         Some(p) => Ok(fs::read(p)?),
@@ -315,6 +334,60 @@ mod tests {
         .unwrap();
         let written = fs::read_to_string(blob_path).unwrap();
         assert!(written.contains(&first.event.id));
+    }
+
+    fn stubbed_stored_kino(was_new_lineage: bool) -> kinora::kino::StoredKino {
+        use kinora::event::Event;
+        use std::collections::BTreeMap as Btm;
+        kinora::kino::StoredKino {
+            event: Event {
+                kind: "markdown".into(),
+                id: "aa".repeat(32),
+                hash: "bb".repeat(32),
+                parents: vec![],
+                ts: "2026-04-19T10:00:00Z".into(),
+                author: "yj".into(),
+                provenance: "unit".into(),
+                metadata: Btm::new(),
+            },
+            lineage: "deadbeef".into(),
+            was_new_lineage,
+        }
+    }
+
+    #[test]
+    fn format_store_summary_uses_event_wording_for_new_events() {
+        let stored = stubbed_stored_kino(true);
+        let summary = format_store_summary(&stored);
+        assert!(summary.contains(" (new event)"), "expected `(new event)`: {summary}");
+        assert!(summary.contains("event=deadbeef"));
+        assert!(
+            !summary.contains("lineage"),
+            "lineage wording should be retired: {summary}",
+        );
+    }
+
+    #[test]
+    fn format_store_summary_omits_suffix_on_idempotent_restore() {
+        let stored = stubbed_stored_kino(false);
+        let summary = format_store_summary(&stored);
+        assert!(
+            !summary.contains("(new"),
+            "no new-event suffix on idempotent re-store: {summary}",
+        );
+        assert!(summary.contains("event=deadbeef"));
+    }
+
+    #[test]
+    fn format_store_summary_has_expected_shape() {
+        let stored = stubbed_stored_kino(true);
+        let summary = format_store_summary(&stored);
+        let expected = format!(
+            "stored kind=markdown id={} hash={} event=deadbeef (new event)",
+            "aa".repeat(32),
+            "bb".repeat(32),
+        );
+        assert_eq!(summary, expected);
     }
 
     #[test]

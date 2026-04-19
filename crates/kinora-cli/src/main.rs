@@ -8,7 +8,7 @@ use resolve::{
     head_lineages, render_all_heads, render_fork_report, run_resolve, ResolveOutcome,
     ResolveRunArgs,
 };
-use store::{run_store, StoreRunArgs};
+use store::{format_store_summary, run_store, StoreRunArgs};
 
 mod cli;
 mod common;
@@ -61,14 +61,7 @@ fn main() -> ExitCode {
             };
             match run_store(&cwd, args) {
                 Ok(stored) => {
-                    println!(
-                        "stored kind={} id={} hash={} lineage={}{}",
-                        stored.event.kind,
-                        stored.event.id,
-                        stored.event.hash,
-                        stored.lineage,
-                        if stored.was_new_lineage { " (new lineage)" } else { "" },
-                    );
+                    println!("{}", format_store_summary(&stored));
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
