@@ -55,6 +55,38 @@ pub enum Command {
         /// Additional metadata `KEY=VALUE`; repeatable.
         #[facet(args::named, args::short = 'm', default)]
         metadata: Vec<String>,
+
+        /// Root to assign this kino to, as an atomic store+assign pair.
+        /// Omit to write only the store event — compaction will route the
+        /// kino to the `inbox` root implicitly (phase 3.5).
+        #[facet(args::named, default)]
+        root: Option<String>,
+    },
+
+    /// Assign a kino to a named root. Writes a standalone `assign` event
+    /// to the hot ledger; compact (phase 3.5) consumes it to decide which
+    /// kinos render into which root.
+    Assign {
+        /// Either a 64-hex identity hash or a metadata `name`.
+        #[facet(args::positional)]
+        kino: String,
+
+        /// Target root name.
+        #[facet(args::positional)]
+        root: String,
+
+        /// Comma-separated list of prior assign-event hashes this one
+        /// supersedes. Optional.
+        #[facet(args::named, default)]
+        resolves: Option<String>,
+
+        /// Override author (defaults to `user.name` from git config).
+        #[facet(args::named, default)]
+        author: Option<String>,
+
+        /// Provenance of this assign. Defaults to `assign`.
+        #[facet(args::named, default)]
+        provenance: Option<String>,
     },
 
     /// Render the repo's kinos and kinographs into an mdbook project under

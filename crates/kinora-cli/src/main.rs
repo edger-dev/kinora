@@ -1,6 +1,7 @@
 use std::io::Write;
 use std::process::ExitCode;
 
+use assign::{format_assign_summary, run_assign, AssignRunArgs};
 use cli::{Cli, Command};
 use compact::{run_compact, CompactRunArgs};
 use render::{run_render, RenderRunArgs};
@@ -10,6 +11,7 @@ use resolve::{
 };
 use store::{format_store_summary, run_store, StoreRunArgs};
 
+mod assign;
 mod cli;
 mod common;
 mod compact;
@@ -47,6 +49,7 @@ fn main() -> ExitCode {
             draft,
             author,
             metadata,
+            root,
         } => {
             let args = StoreRunArgs {
                 kind,
@@ -58,10 +61,24 @@ fn main() -> ExitCode {
                 draft,
                 author,
                 metadata,
+                root,
             };
             match run_store(&cwd, args) {
                 Ok(stored) => {
                     println!("{}", format_store_summary(&stored));
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Command::Assign { kino, root, resolves, author, provenance } => {
+            let args = AssignRunArgs { kino, root, resolves, author, provenance };
+            match run_assign(&cwd, args) {
+                Ok(result) => {
+                    println!("{}", format_assign_summary(&result));
                     ExitCode::SUCCESS
                 }
                 Err(e) => {

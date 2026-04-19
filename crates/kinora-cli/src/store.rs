@@ -3,10 +3,11 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::Path;
 
+use kinora::assign::{write_assign, AssignEvent};
 use kinora::author::resolve_author_from_git;
 use kinora::kino::{store_kino, StoreKinoParams, StoredKino};
 use kinora::kinograph::Kinograph;
-use kinora::paths::kinora_root;
+use kinora::paths::{hot_event_path, kinora_root};
 use kinora::resolve::Resolver;
 
 use crate::common::{find_repo_root, parse_metadata_flag, parse_parents, CliError};
@@ -23,11 +24,18 @@ pub struct StoreRunArgs {
     pub draft: bool,
     pub author: Option<String>,
     pub metadata: Vec<String>,
+    pub root: Option<String>,
 }
 
 pub fn run_store(cwd: &Path, args: StoreRunArgs) -> Result<StoredKino, CliError> {
     let repo_root = find_repo_root(cwd)?;
     let kin_root = kinora_root(&repo_root);
+
+    if let Some(root) = args.root.as_deref()
+        && root.is_empty()
+    {
+        return Err(CliError::EmptyRoot);
+    }
 
     let raw_content = read_content(args.path.as_deref())?;
     let content = if args.kind == "kinograph" {
@@ -63,15 +71,50 @@ pub fn run_store(cwd: &Path, args: StoreRunArgs) -> Result<StoredKino, CliError>
     let params = StoreKinoParams {
         kind: args.kind,
         content,
-        author,
-        provenance: args.provenance,
-        ts,
+        author: author.clone(),
+        provenance: args.provenance.clone(),
+        ts: ts.clone(),
         metadata,
         id: args.id,
         parents,
     };
     let stored = store_kino(&kin_root, params)?;
+
+    if let Some(root) = args.root {
+        let assign = AssignEvent {
+            kino_id: stored.event.id.clone(),
+            target_root: root,
+            supersedes: vec![],
+            author,
+            ts,
+            provenance: args.provenance,
+        };
+        pair_assign_with_rollback(&kin_root, &stored, &assign)?;
+    }
+
     Ok(stored)
+}
+
+/// Write `assign` as the second half of a `kinora store --root` pair.
+/// On failure, best-effort deletes the store event's hot file iff this
+/// call introduced it (stored.was_new_lineage), preserving the atomic-pair
+/// invariant — "both events land, or neither does".
+fn pair_assign_with_rollback(
+    kin_root: &Path,
+    stored: &StoredKino,
+    assign: &AssignEvent,
+) -> Result<(), CliError> {
+    match write_assign(kin_root, assign) {
+        Ok(_) => Ok(()),
+        Err(assign_err) => {
+            if stored.was_new_lineage
+                && let Ok(h) = stored.event.event_hash()
+            {
+                let _ = fs::remove_file(hot_event_path(kin_root, &h));
+            }
+            Err(assign_err.into())
+        }
+    }
 }
 
 /// Format the one-line human summary printed after a successful `kinora
@@ -142,6 +185,7 @@ mod tests {
             draft: false,
             author: Some("YJ".into()),
             metadata: vec![],
+            root: None,
         }
     }
 
@@ -388,6 +432,128 @@ mod tests {
             "bb".repeat(32),
         );
         assert_eq!(summary, expected);
+    }
+
+    // ---- --root atomic-pair tests (g08g Phase B) ----
+
+    #[test]
+    fn store_without_root_writes_exactly_one_event() {
+        let tmp = repo();
+        let src = tmp.path().join("x.md");
+        fs::write(&src, b"x").unwrap();
+
+        run_store(tmp.path(), base_args("markdown", src.to_str().unwrap())).unwrap();
+
+        let events = Ledger::new(kinora_root(tmp.path()))
+            .read_all_events()
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].is_store_event());
+    }
+
+    #[test]
+    fn store_with_root_writes_both_events_as_pair() {
+        use kinora::assign::{EVENT_KIND_ASSIGN, META_TARGET_ROOT};
+
+        let tmp = repo();
+        let src = tmp.path().join("x.md");
+        fs::write(&src, b"paired").unwrap();
+
+        let mut args = base_args("markdown", src.to_str().unwrap());
+        args.root = Some("main".into());
+        let stored = run_store(tmp.path(), args).unwrap();
+
+        let events = Ledger::new(kinora_root(tmp.path()))
+            .read_all_events()
+            .unwrap();
+        assert_eq!(events.len(), 2);
+
+        let assign = events
+            .iter()
+            .find(|e| e.event_kind == EVENT_KIND_ASSIGN)
+            .expect("assign event must be present");
+        assert_eq!(assign.id, stored.event.id);
+        assert_eq!(assign.metadata.get(META_TARGET_ROOT).unwrap(), "main");
+        assert!(assign.parents.is_empty(), "birth-assign has no supersedes");
+    }
+
+    #[test]
+    fn store_with_empty_root_rejected_before_write() {
+        let tmp = repo();
+        let src = tmp.path().join("x.md");
+        fs::write(&src, b"x").unwrap();
+
+        let mut args = base_args("markdown", src.to_str().unwrap());
+        args.root = Some(String::new());
+        let err = run_store(tmp.path(), args).unwrap_err();
+        assert!(matches!(err, CliError::EmptyRoot), "got {err:?}");
+
+        // Nothing written to disk.
+        let events = Ledger::new(kinora_root(tmp.path()))
+            .read_all_events()
+            .unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn store_with_root_rolls_back_store_event_on_assign_failure() {
+        // Injects a failure at the second write of the atomic pair by
+        // pre-placing a directory at the expected assign event hot-file
+        // path, which makes `fs::rename(tmp, target)` fail — exactly the
+        // failure mode we must roll back from.
+        use kinora::assign::AssignEvent;
+        use kinora::paths::hot_event_path;
+
+        let tmp = repo();
+        let kin_root = kinora_root(tmp.path());
+        let src = tmp.path().join("x.md");
+        fs::write(&src, b"rollback-me").unwrap();
+
+        // Pre-compute the assign event hash with the same ts/author/root
+        // that run_store will produce. We can't predict jiff::Timestamp::now,
+        // so we simulate the pair directly via store_kino + pair_assign_with_rollback
+        // with a fixed ts.
+        let content = b"rollback-me-inner".to_vec();
+        let params = StoreKinoParams {
+            kind: "markdown".into(),
+            content: content.clone(),
+            author: "YJ".into(),
+            provenance: "unit-test".into(),
+            ts: "2026-04-19T10:05:00Z".into(),
+            metadata: std::collections::BTreeMap::from([("name".into(), "rb".into())]),
+            id: None,
+            parents: vec![],
+        };
+        let stored = kinora::kino::store_kino(&kin_root, params).unwrap();
+        assert!(stored.was_new_lineage);
+
+        // Build the assign we're going to write, then sabotage its target
+        // path with a directory to force `fs::rename` to fail.
+        let assign = AssignEvent {
+            kino_id: stored.event.id.clone(),
+            target_root: "main".into(),
+            supersedes: vec![],
+            author: "YJ".into(),
+            ts: "2026-04-19T10:05:00Z".into(),
+            provenance: "unit-test".into(),
+        };
+        let assign_hash = assign.event_hash().unwrap();
+        let assign_path = hot_event_path(&kin_root, &assign_hash);
+        fs::create_dir_all(&assign_path).unwrap();
+        // Non-empty dir blocks fs::rename more reliably across platforms.
+        fs::write(assign_path.join("blocker"), b"x").unwrap();
+
+        let err = pair_assign_with_rollback(&kin_root, &stored, &assign).unwrap_err();
+        assert!(matches!(err, CliError::Assign(_)), "got {err:?}");
+
+        // Rollback: store event hot file must be gone.
+        let store_event_hash = stored.event.event_hash().unwrap();
+        let store_event_path = hot_event_path(&kin_root, &store_event_hash);
+        assert!(
+            !store_event_path.exists(),
+            "store event hot file should have been rolled back: {}",
+            store_event_path.display()
+        );
     }
 
     #[test]

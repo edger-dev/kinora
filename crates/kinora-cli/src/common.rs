@@ -2,6 +2,7 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use kinora::assign::AssignError;
 use kinora::compact::CompactError;
 use kinora::config::ConfigError;
 use kinora::kino::StoreKinoError;
@@ -21,6 +22,7 @@ pub enum CliError {
     ConflictingDraftFlag,
     AuthorUnresolved,
     CacheHomeUnresolved,
+    EmptyRoot,
     Config(ConfigError),
     StoreKino(StoreKinoError),
     Resolve(ResolveError),
@@ -30,6 +32,7 @@ pub enum CliError {
     Compact(CompactError),
     Store(StoreError),
     Root(RootError),
+    Assign(AssignError),
 }
 
 impl fmt::Display for CliError {
@@ -57,6 +60,7 @@ impl fmt::Display for CliError {
                 f,
                 "could not resolve cache root: set $XDG_CACHE_HOME or $HOME, or pass --cache-dir"
             ),
+            CliError::EmptyRoot => write!(f, "--root must be a non-empty root name"),
             CliError::Config(e) => write!(f, "{e}"),
             CliError::StoreKino(e) => write!(f, "{e}"),
             CliError::Resolve(e) => write!(f, "{e}"),
@@ -66,6 +70,7 @@ impl fmt::Display for CliError {
             CliError::Compact(e) => write!(f, "{e}"),
             CliError::Store(e) => write!(f, "{e}"),
             CliError::Root(e) => write!(f, "{e}"),
+            CliError::Assign(e) => write!(f, "{e}"),
         }
     }
 }
@@ -117,6 +122,12 @@ impl From<LedgerError> for CliError {
 impl From<CompactError> for CliError {
     fn from(e: CompactError) -> Self {
         CliError::Compact(e)
+    }
+}
+
+impl From<AssignError> for CliError {
+    fn from(e: AssignError) -> Self {
+        CliError::Assign(e)
     }
 }
 

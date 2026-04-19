@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use crate::event::{Event, EventError, EVENT_KIND_ASSIGN};
+use crate::event::{Event, EventError};
+pub use crate::event::EVENT_KIND_ASSIGN;
 use crate::hash::Hash;
 use crate::ledger::{Ledger, LedgerError};
 
