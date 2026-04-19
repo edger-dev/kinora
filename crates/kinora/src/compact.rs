@@ -22,6 +22,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use crate::assign::AssignError;
 use crate::config::{Config, ConfigError};
 use crate::event::{Event, EventError};
 use crate::hash::{Hash, HashParseError};
@@ -30,6 +31,17 @@ use crate::ledger::{Ledger, LedgerError};
 use crate::paths::{config_path, root_pointer_path, roots_dir};
 use crate::root::{RootEntry, RootError, RootKinograph};
 use crate::store::{ContentStore, StoreError};
+
+/// A single live assign candidate surfaced in `AmbiguousAssign` so callers
+/// (notably the CLI) can render the D2 resolution hint without re-loading
+/// the hot ledger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssignCandidate {
+    pub event_hash: String,
+    pub target_root: String,
+    pub author: String,
+    pub ts: String,
+}
 
 #[derive(Debug)]
 pub enum CompactError {
@@ -40,12 +52,22 @@ pub enum CompactError {
     Root(RootError),
     StoreKino(StoreKinoError),
     Config(ConfigError),
+    Assign(AssignError),
     InvalidHash { value: String, err: HashParseError },
     MultipleHeads { id: String, heads: Vec<String> },
     NoHead { id: String },
     PriorEventMissing { version: String },
     InvalidPointer { path: PathBuf, body: String },
     InvalidRootName { name: String },
+    /// A kino has two or more live (non-superseded) assign events pointing
+    /// at it. The compact cannot decide ownership; the user must author a
+    /// tie-breaking assign whose `supersedes` list names all candidates.
+    AmbiguousAssign { kino_id: String, candidates: Vec<AssignCandidate> },
+    /// A live assign references a root name that is not declared in
+    /// `config.styx`. Raised during `compact_root` regardless of which
+    /// root is currently being compacted — an undeclared target is a
+    /// config/user error that must be fixed globally.
+    UnknownRoot { name: String, event_hash: String },
 }
 
 impl std::fmt::Display for CompactError {
@@ -83,6 +105,16 @@ impl std::fmt::Display for CompactError {
             CompactError::InvalidRootName { name } => write!(
                 f,
                 "invalid root name {name:?}: must be a single path component with no `/`, `\\`, or `..`"
+            ),
+            CompactError::Assign(e) => write!(f, "{e}"),
+            CompactError::AmbiguousAssign { kino_id, candidates } => write!(
+                f,
+                "ambiguous assigns for kino {kino_id}: {} live candidates",
+                candidates.len()
+            ),
+            CompactError::UnknownRoot { name, event_hash } => write!(
+                f,
+                "unknown root `{name}` referenced by assign event {event_hash}"
             ),
         }
     }
@@ -129,6 +161,12 @@ impl From<StoreKinoError> for CompactError {
 impl From<ConfigError> for CompactError {
     fn from(e: ConfigError) -> Self {
         CompactError::Config(e)
+    }
+}
+
+impl From<AssignError> for CompactError {
+    fn from(e: AssignError) -> Self {
+        CompactError::Assign(e)
     }
 }
 
@@ -379,6 +417,7 @@ pub fn compact_all(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::assign::{AssignEvent, EVENT_KIND_ASSIGN};
     use crate::init::init;
     use crate::kino::{store_kino, StoreKinoParams};
     use crate::paths::kinora_root;
@@ -878,4 +917,314 @@ roots {
         assert!(res.new_version.is_none());
         assert!(res.prior_version.is_none());
     }
+
+    // ------------------------------------------------------------------
+    // 7mou: compact consumes assigns + AmbiguousAssign + UnknownRoot
+    // ------------------------------------------------------------------
+
+    fn write_assign_for(
+        kin: &Path,
+        kino_id: &str,
+        target_root: &str,
+        supersedes: Vec<String>,
+        ts: &str,
+    ) -> Hash {
+        let a = AssignEvent {
+            kino_id: kino_id.to_owned(),
+            target_root: target_root.to_owned(),
+            supersedes,
+            author: "yj".into(),
+            ts: ts.to_owned(),
+            provenance: "compact-test".into(),
+        };
+        let (h, _) = crate::assign::write_assign(kin, &a).unwrap();
+        h
+    }
+
+    fn root_ids(kin: &Path, version: &Hash) -> Vec<String> {
+        let bytes = ContentStore::new(kin).read(version).unwrap();
+        let parsed = RootKinograph::parse(&bytes).unwrap();
+        parsed.entries.into_iter().map(|e| e.id).collect()
+    }
+
+    #[test]
+    fn single_live_assign_routes_kino_to_target_root_not_inbox() {
+        let (_t, root) = setup();
+        write_config(
+            &root,
+            r#"repo-url "https://example.com/x.git"
+roots {
+  rfcs { policy "never" }
+}
+"#,
+        );
+
+        let k = store_md(&root, b"spec", "spec", "2026-04-19T10:00:00Z");
+        write_assign_for(&root, &k.id, "rfcs", vec![], "2026-04-19T10:00:01Z");
+
+        // rfcs gets the kino; inbox does not.
+        let rfcs_res =
+            compact_root(&root, "rfcs", params("yj", "2026-04-19T10:00:02Z")).unwrap();
+        let rfcs_ids = root_ids(&root, &rfcs_res.new_version.unwrap());
+        assert_eq!(rfcs_ids, vec![k.id.clone()], "rfcs should own the kino");
+
+        let inbox_res =
+            compact_root(&root, "inbox", params("yj", "2026-04-19T10:00:03Z")).unwrap();
+        assert!(
+            inbox_res.new_version.is_none(),
+            "inbox should be empty (no-op) since the kino is routed to rfcs"
+        );
+    }
+
+    #[test]
+    fn unassigned_kinos_default_to_inbox_not_main() {
+        let (_t, root) = setup();
+        write_config(
+            &root,
+            r#"repo-url "https://example.com/x.git"
+roots {
+  main { policy "never" }
+}
+"#,
+        );
+
+        let k = store_md(&root, b"x", "x", "2026-04-19T10:00:00Z");
+
+        let inbox_res =
+            compact_root(&root, "inbox", params("yj", "2026-04-19T10:00:01Z")).unwrap();
+        let inbox_ids = root_ids(&root, &inbox_res.new_version.unwrap());
+        assert_eq!(inbox_ids, vec![k.id.clone()], "unassigned kino should land in inbox");
+
+        let main_res =
+            compact_root(&root, "main", params("yj", "2026-04-19T10:00:02Z")).unwrap();
+        assert!(
+            main_res.new_version.is_none(),
+            "main should be no-op; unassigned kinos do not implicitly land there"
+        );
+    }
+
+    #[test]
+    fn superseded_assign_is_not_live_superseder_wins() {
+        let (_t, root) = setup();
+        write_config(
+            &root,
+            r#"repo-url "https://example.com/x.git"
+roots {
+  rfcs { policy "never" }
+  designs { policy "never" }
+}
+"#,
+        );
+
+        let k = store_md(&root, b"doc", "doc", "2026-04-19T10:00:00Z");
+        let first = write_assign_for(&root, &k.id, "rfcs", vec![], "2026-04-19T10:00:01Z");
+        // Reassign to designs, superseding the first.
+        write_assign_for(
+            &root,
+            &k.id,
+            "designs",
+            vec![first.as_hex().to_owned()],
+            "2026-04-19T10:00:02Z",
+        );
+
+        let designs_res =
+            compact_root(&root, "designs", params("yj", "2026-04-19T10:00:03Z")).unwrap();
+        let designs_ids = root_ids(&root, &designs_res.new_version.unwrap());
+        assert_eq!(designs_ids, vec![k.id.clone()], "designs wins after supersede");
+
+        let rfcs_res =
+            compact_root(&root, "rfcs", params("yj", "2026-04-19T10:00:04Z")).unwrap();
+        assert!(
+            rfcs_res.new_version.is_none(),
+            "rfcs should be no-op; its live assign was superseded"
+        );
+    }
+
+    #[test]
+    fn transitively_superseded_assign_only_terminal_superseder_is_live() {
+        // A superseded by B, B superseded by C → only C counts.
+        let (_t, root) = setup();
+        write_config(
+            &root,
+            r#"repo-url "https://example.com/x.git"
+roots {
+  a { policy "never" }
+  b { policy "never" }
+  c { policy "never" }
+}
+"#,
+        );
+
+        let k = store_md(&root, b"doc", "doc", "2026-04-19T10:00:00Z");
+        let ha = write_assign_for(&root, &k.id, "a", vec![], "2026-04-19T10:00:01Z");
+        let hb = write_assign_for(
+            &root,
+            &k.id,
+            "b",
+            vec![ha.as_hex().to_owned()],
+            "2026-04-19T10:00:02Z",
+        );
+        write_assign_for(
+            &root,
+            &k.id,
+            "c",
+            vec![hb.as_hex().to_owned()],
+            "2026-04-19T10:00:03Z",
+        );
+
+        let c_res = compact_root(&root, "c", params("yj", "2026-04-19T10:00:04Z")).unwrap();
+        let c_ids = root_ids(&root, &c_res.new_version.unwrap());
+        assert_eq!(c_ids, vec![k.id.clone()]);
+
+        let a_res = compact_root(&root, "a", params("yj", "2026-04-19T10:00:05Z")).unwrap();
+        assert!(a_res.new_version.is_none(), "a's assign was superseded");
+
+        let b_res = compact_root(&root, "b", params("yj", "2026-04-19T10:00:06Z")).unwrap();
+        assert!(b_res.new_version.is_none(), "b's assign was superseded");
+    }
+
+    #[test]
+    fn two_competing_live_assigns_raise_ambiguous_assign() {
+        let (_t, root) = setup();
+        write_config(
+            &root,
+            r#"repo-url "https://example.com/x.git"
+roots {
+  rfcs { policy "never" }
+  designs { policy "never" }
+}
+"#,
+        );
+
+        let k = store_md(&root, b"doc", "doc", "2026-04-19T10:00:00Z");
+        let h1 = write_assign_for(&root, &k.id, "rfcs", vec![], "2026-04-19T10:00:01Z");
+        let h2 =
+            write_assign_for(&root, &k.id, "designs", vec![], "2026-04-19T10:00:02Z");
+
+        let err =
+            compact_root(&root, "rfcs", params("yj", "2026-04-19T10:00:03Z")).unwrap_err();
+        match err {
+            CompactError::AmbiguousAssign { kino_id, candidates } => {
+                assert_eq!(kino_id, k.id);
+                assert_eq!(candidates.len(), 2, "should surface both live candidates");
+                let hashes: HashSet<_> =
+                    candidates.iter().map(|c| c.event_hash.clone()).collect();
+                assert!(hashes.contains(h1.as_hex()));
+                assert!(hashes.contains(h2.as_hex()));
+                let targets: HashSet<_> =
+                    candidates.iter().map(|c| c.target_root.clone()).collect();
+                assert!(targets.contains("rfcs"));
+                assert!(targets.contains("designs"));
+            }
+            other => panic!("expected AmbiguousAssign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assign_to_undeclared_root_raises_unknown_root() {
+        let (_t, root) = setup();
+        // Default config declares only `inbox` (auto-provisioned).
+        let k = store_md(&root, b"doc", "doc", "2026-04-19T10:00:00Z");
+        let h =
+            write_assign_for(&root, &k.id, "madeup", vec![], "2026-04-19T10:00:01Z");
+
+        let err =
+            compact_root(&root, "inbox", params("yj", "2026-04-19T10:00:02Z")).unwrap_err();
+        match err {
+            CompactError::UnknownRoot { name, event_hash } => {
+                assert_eq!(name, "madeup");
+                assert_eq!(event_hash, h.as_hex());
+            }
+            other => panic!("expected UnknownRoot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cross_root_removal_kino_moves_from_main_to_rfcs() {
+        let (_t, root) = setup();
+        write_config(
+            &root,
+            r#"repo-url "https://example.com/x.git"
+roots {
+  main { policy "never" }
+  rfcs { policy "never" }
+}
+"#,
+        );
+
+        // Pin the kino to `main` first.
+        let k = store_md(&root, b"doc", "doc", "2026-04-19T10:00:00Z");
+        write_assign_for(&root, &k.id, "main", vec![], "2026-04-19T10:00:01Z");
+
+        let first = compact_all(&root, params("yj", "2026-04-19T10:00:02Z")).unwrap();
+        let by_name: std::collections::HashMap<_, _> =
+            first.into_iter().collect();
+        let main_v1 = by_name["main"].as_ref().unwrap().new_version.clone().unwrap();
+        let main_ids = root_ids(&root, &main_v1);
+        assert_eq!(main_ids, vec![k.id.clone()], "main should initially own the kino");
+
+        // Reassign to rfcs; main's last-assign hash is looked up from the
+        // previous step's event stream via the ledger.
+        let prior_assigns = Ledger::new(&root).read_all_events().unwrap();
+        let prior_main_assign = prior_assigns
+            .iter()
+            .find(|e| e.event_kind == EVENT_KIND_ASSIGN)
+            .unwrap();
+        let supersedes_hash = prior_main_assign.event_hash().unwrap();
+        write_assign_for(
+            &root,
+            &k.id,
+            "rfcs",
+            vec![supersedes_hash.as_hex().to_owned()],
+            "2026-04-19T10:00:03Z",
+        );
+
+        // Re-compact both roots. Main should drop the kino; rfcs should gain it.
+        let second = compact_all(&root, params("yj", "2026-04-19T10:00:04Z")).unwrap();
+        let by_name: std::collections::HashMap<_, _> =
+            second.into_iter().collect();
+
+        let main_v2 = by_name["main"].as_ref().unwrap();
+        let main_v2_hash = main_v2.new_version.as_ref().expect("main should bump");
+        let main_ids_v2 = root_ids(&root, main_v2_hash);
+        assert!(
+            main_ids_v2.is_empty(),
+            "main should no longer contain the kino after reassign, got {main_ids_v2:?}"
+        );
+
+        let rfcs_v1 = by_name["rfcs"].as_ref().unwrap();
+        let rfcs_ids = root_ids(&root, &rfcs_v1.new_version.clone().unwrap());
+        assert_eq!(rfcs_ids, vec![k.id.clone()], "rfcs should now own the kino");
+    }
+
+    #[test]
+    fn ambiguous_assign_candidates_carry_author_and_ts() {
+        // The rendered D2 hint needs author + ts per candidate; check the
+        // CompactError payload carries them through.
+        let (_t, root) = setup();
+        write_config(
+            &root,
+            r#"repo-url "https://example.com/x.git"
+roots {
+  rfcs { policy "never" }
+  designs { policy "never" }
+}
+"#,
+        );
+        let k = store_md(&root, b"x", "x", "2026-04-19T10:00:00Z");
+        write_assign_for(&root, &k.id, "rfcs", vec![], "2026-04-19T10:00:01Z");
+        write_assign_for(&root, &k.id, "designs", vec![], "2026-04-19T10:00:02Z");
+
+        let err =
+            compact_root(&root, "rfcs", params("yj", "2026-04-19T10:00:03Z")).unwrap_err();
+        let candidates = match err {
+            CompactError::AmbiguousAssign { candidates, .. } => candidates,
+            other => panic!("expected AmbiguousAssign, got {other:?}"),
+        };
+        assert!(candidates.iter().all(|c| c.author == "yj"));
+        let timestamps: HashSet<_> = candidates.iter().map(|c| c.ts.clone()).collect();
+        assert!(timestamps.contains("2026-04-19T10:00:01Z"));
+        assert!(timestamps.contains("2026-04-19T10:00:02Z"));
+    }
+
 }
