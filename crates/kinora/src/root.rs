@@ -45,7 +45,6 @@ pub enum RootError {
     Serialize(String),
     InvalidEntry { idx: usize, reason: String },
     DuplicateId { idx: usize, id: String },
-    Utf8(std::string::FromUtf8Error),
 }
 
 impl std::fmt::Display for RootError {
@@ -59,18 +58,11 @@ impl std::fmt::Display for RootError {
             RootError::DuplicateId { idx, id } => {
                 write!(f, "duplicate id at entry [{idx}]: {id}")
             }
-            RootError::Utf8(e) => write!(f, "root kinograph bytes are not valid UTF-8: {e}"),
         }
     }
 }
 
 impl std::error::Error for RootError {}
-
-impl From<std::string::FromUtf8Error> for RootError {
-    fn from(e: std::string::FromUtf8Error) -> Self {
-        RootError::Utf8(e)
-    }
-}
 
 impl RootEntry {
     /// Build a minimal root entry. Note and pin default to their
@@ -320,6 +312,64 @@ mod tests {
             entries: vec![sample_entry(1), sample_entry(2), sample_entry(3)],
         };
         assert_eq!(a.to_styx().unwrap(), b.to_styx().unwrap());
+    }
+
+    #[test]
+    fn to_styx_emits_metadata_keys_in_sorted_order() {
+        // The canonical-form rule says metadata keys are sorted. BTreeMap
+        // gives us this for free today — this test pins the invariant so
+        // future refactors (e.g. switching the struct to HashMap) fail
+        // loudly instead of silently breaking determinism.
+        let mut e = sample_entry(1);
+        e.metadata.clear();
+        e.metadata.insert("title".into(), "Z".into());
+        e.metadata.insert("description".into(), "M".into());
+        e.metadata.insert("name".into(), "A".into());
+        let r = RootKinograph {
+            entries: vec![e],
+        };
+        let s = r.to_styx().unwrap();
+        let desc_pos = s.find("description").expect("description key");
+        let name_pos = s.find("name").expect("name key");
+        let title_pos = s.find("title").expect("title key");
+        assert!(
+            desc_pos < name_pos && name_pos < title_pos,
+            "metadata keys not in sorted order in:\n{s}"
+        );
+    }
+
+    #[test]
+    fn parse_from_bytes_matches_parse_str() {
+        let r = RootKinograph {
+            entries: vec![sample_entry(1)],
+        };
+        let s = r.to_styx().unwrap();
+        let from_str = RootKinograph::parse_str(&s).unwrap();
+        let from_bytes = RootKinograph::parse(s.as_bytes()).unwrap();
+        assert_eq!(from_str, from_bytes);
+    }
+
+    #[test]
+    fn parse_invalid_utf8_errors_as_parse() {
+        let bad: &[u8] = &[0xff, 0xfe, 0xfd];
+        let err = RootKinograph::parse(bad).unwrap_err();
+        assert!(matches!(err, RootError::Parse(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn missing_pin_and_note_default_to_false_and_empty() {
+        // Parsing a styx document that omits optional `note` and `pin`
+        // must yield `pin == false` and `note.is_empty()`. Guards the
+        // `#[facet(default)]` contract from silent regression.
+        let id = id(1);
+        let version = version_hash(1);
+        let input = format!(
+            "entries ({{id {id}, version {version}, kind markdown, metadata {{name x}}}})"
+        );
+        let r = RootKinograph::parse_str(&input).unwrap();
+        assert_eq!(r.entries.len(), 1);
+        assert!(!r.entries[0].pin, "pin should default to false");
+        assert!(r.entries[0].note.is_empty(), "note should default to empty");
     }
 
     #[test]
