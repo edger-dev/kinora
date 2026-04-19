@@ -4,6 +4,12 @@ use std::process::ExitCode;
 use assign::{format_assign_summary, run_assign, AssignRunArgs};
 use cli::{Cli, Command};
 use compact::{render_compact_entry, run_compact, CompactRunArgs};
+use fastrace::collector::{Config as FastraceConfig, ConsoleReporter, SpanContext};
+use fastrace::Span;
+use logforth::append::{FastraceEvent, Stderr};
+use logforth::diagnostic::FastraceDiagnostic;
+use logforth::filter::env_filter::EnvFilterBuilder;
+use logforth::record::LevelFilter;
 use render::{run_render, RenderRunArgs};
 use resolve::{
     head_lineages, render_all_heads, render_fork_report, run_resolve, ResolveOutcome,
@@ -20,6 +26,45 @@ mod resolve;
 mod store;
 
 fn main() -> ExitCode {
+    init_logging();
+    let code = {
+        let root = Span::root("kinora.main", SpanContext::random());
+        let _g = root.set_local_parent();
+        run()
+    };
+    fastrace::flush();
+    code
+}
+
+/// Wire logforth + fastrace.
+///
+/// Two dispatches:
+///   1. `FastraceEvent` — bridges `log::*` events into the active fastrace
+///      span so they appear inline on traces when a reporter is attached.
+///   2. `Stderr` with `FastraceDiagnostic` — stamps trace/span ids on
+///      stderr output. `RUST_LOG` gates level via the default `EnvFilter`.
+///
+/// `KINORA_TRACE=1` installs a `ConsoleReporter` so fastrace dumps every
+/// root span to stderr on `flush()`. Off by default — tracing is opt-in.
+fn init_logging() {
+    logforth::starter_log::builder()
+        .dispatch(|d| {
+            d.filter(LevelFilter::All)
+                .append(FastraceEvent::default())
+        })
+        .dispatch(|d| {
+            d.filter(EnvFilterBuilder::from_default_env_or("info").build())
+                .diagnostic(FastraceDiagnostic::default())
+                .append(Stderr::default())
+        })
+        .apply();
+
+    if std::env::var("KINORA_TRACE").is_ok_and(|v| v == "1") {
+        fastrace::set_reporter(ConsoleReporter, FastraceConfig::default());
+    }
+}
+
+fn run() -> ExitCode {
     let cli: Cli = match figue::from_std_args::<Cli>().into_result() {
         Ok(output) => output.get(),
         Err(e) => {

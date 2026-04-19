@@ -53,6 +53,7 @@ impl From<ConfigError> for InitError {
 /// and sets HEAD.
 ///
 /// Refuses if `.kinora/` already exists.
+#[fastrace::trace]
 pub fn init(repo_root: &Path, repo_url: &str) -> Result<Config, InitError> {
     let root = kinora_root(repo_root);
     if root.exists() {

@@ -239,6 +239,7 @@ impl ExternalRefs {
     /// failure) is silently skipped: that root's own per-root compact
     /// will surface the failure on its own, and cross-root integrity is
     /// a best-effort layer.
+    #[fastrace::trace]
     pub fn collect(
         kinora_root: &Path,
         declared_roots: &BTreeSet<String>,
@@ -258,15 +259,35 @@ impl ExternalRefs {
             let root_ptr = match read_root_pointer(kinora_root, source_root) {
                 Ok(Some(h)) => h,
                 Ok(None) => continue,
-                Err(_) => continue,
+                Err(e) => {
+                    log::debug!(
+                        target: "kinora::compact::refs",
+                        "skip root {source_root:?}: unreadable pointer: {e}",
+                    );
+                    continue;
+                }
             };
             let root_bytes = match store.read(&root_ptr) {
                 Ok(b) => b,
-                Err(_) => continue,
+                Err(e) => {
+                    log::debug!(
+                        target: "kinora::compact::refs",
+                        "skip root {source_root:?}: missing root blob {}: {e}",
+                        root_ptr.as_hex(),
+                    );
+                    continue;
+                }
             };
             let root_kg = match RootKinograph::parse(&root_bytes) {
                 Ok(k) => k,
-                Err(_) => continue,
+                Err(e) => {
+                    log::debug!(
+                        target: "kinora::compact::refs",
+                        "skip root {source_root:?}: root blob {} did not parse: {e}",
+                        root_ptr.as_hex(),
+                    );
+                    continue;
+                }
             };
             for entry in &root_kg.entries {
                 if entry.kind != "kinograph" {
@@ -274,15 +295,36 @@ impl ExternalRefs {
                 }
                 let version_hash = match Hash::from_str(&entry.version) {
                     Ok(h) => h,
-                    Err(_) => continue,
+                    Err(e) => {
+                        log::debug!(
+                            target: "kinora::compact::refs",
+                            "skip entry in {source_root:?}: invalid version hash {:?}: {e}",
+                            entry.version,
+                        );
+                        continue;
+                    }
                 };
                 let kg_bytes = match store.read(&version_hash) {
                     Ok(b) => b,
-                    Err(_) => continue,
+                    Err(e) => {
+                        log::debug!(
+                            target: "kinora::compact::refs",
+                            "skip entry in {source_root:?}: missing kinograph blob {}: {e}",
+                            entry.version,
+                        );
+                        continue;
+                    }
                 };
                 let kg = match Kinograph::parse(&kg_bytes) {
                     Ok(k) => k,
-                    Err(_) => continue,
+                    Err(e) => {
+                        log::debug!(
+                            target: "kinora::compact::refs",
+                            "skip entry in {source_root:?}: kinograph {} did not parse: {e}",
+                            entry.version,
+                        );
+                        continue;
+                    }
                 };
                 for comp in &kg.entries {
                     let target_version = if !comp.pin.is_empty() {
@@ -293,7 +335,14 @@ impl ExternalRefs {
                         };
                         match pick_head(&comp.id, group) {
                             Ok(head) => head.hash.clone(),
-                            Err(_) => continue,
+                            Err(e) => {
+                                log::debug!(
+                                    target: "kinora::compact::refs",
+                                    "skip comp {} in {source_root:?}: head pick failed: {e}",
+                                    comp.id,
+                                );
+                                continue;
+                            }
                         }
                     };
                     out.entry((comp.id.clone(), target_version))
@@ -561,6 +610,7 @@ fn pick_head<'a>(id: &str, events: &[&'a Event]) -> Result<&'a Event, CompactErr
 /// No-op: returns `new_version = None` when either
 ///  - no prior pointer exists AND there are no hot events to promote, or
 ///  - a prior pointer exists AND the fresh canonical bytes match it.
+#[fastrace::trace]
 pub fn compact_root(
     kinora_root: &Path,
     root_name: &str,
@@ -591,6 +641,7 @@ pub fn compact_root(
 /// (built once per `compact_all` batch) and skips the config + event
 /// re-reads. Standalone `compact_root` calls wrap this with a per-call
 /// snapshot.
+#[fastrace::trace]
 #[allow(clippy::too_many_arguments)]
 fn compact_root_with_refs(
     kinora_root: &Path,
@@ -816,7 +867,16 @@ fn apply_root_entry_gc(
         };
         let old = match parse_ts(&head.ts) {
             Ok(t) => t < cutoff,
-            Err(_) => false,
+            Err(e) => {
+                log::warn!(
+                    target: "kinora::compact::gc",
+                    "root={root_name:?} entry id={:?} version={:?}: unparseable head ts {:?}; keeping entry: {e}",
+                    entry.id,
+                    entry.version,
+                    head.ts,
+                );
+                false
+            }
         };
         if !old {
             return true;
@@ -944,7 +1004,19 @@ fn prune_hot_events(
                     if is_implicit_pinned(&e.id, &e.hash) {
                         continue;
                     }
-                    let Ok(ts) = parse_ts(&e.ts) else { continue };
+                    let ts = match parse_ts(&e.ts) {
+                        Ok(t) => t,
+                        Err(err) => {
+                            log::warn!(
+                                target: "kinora::compact::prune",
+                                "root={root_name:?} store event id={:?} hash={:?}: unparseable ts {:?}; keeping event: {err}",
+                                e.id,
+                                e.hash,
+                                e.ts,
+                            );
+                            continue;
+                        }
+                    };
                     if ts < cutoff {
                         drop_hashes.insert(e.event_hash()?);
                     }
@@ -953,7 +1025,18 @@ fn prune_hot_events(
             // Assigns: age-based only, no pin protection (assigns aren't
             // pin-addressable — pins name store-event content hashes).
             for e in &owned_assigns {
-                let Ok(ts) = parse_ts(&e.ts) else { continue };
+                let ts = match parse_ts(&e.ts) {
+                    Ok(t) => t,
+                    Err(err) => {
+                        log::warn!(
+                            target: "kinora::compact::prune",
+                            "root={root_name:?} assign event hash={:?}: unparseable ts {:?}; keeping event: {err}",
+                            e.hash,
+                            e.ts,
+                        );
+                        continue;
+                    }
+                };
                 if ts < cutoff {
                     drop_hashes.insert(e.event_hash()?);
                 }
@@ -1009,6 +1092,7 @@ pub type CompactAllEntry = (String, Result<CompactResult, CompactError>);
 ///
 /// The outer `Result::Err` is reserved for pre-iteration failures:
 /// config file missing, unreadable, or unparseable.
+#[fastrace::trace]
 pub fn compact_all(
     kinora_root: &Path,
     params: CompactParams,

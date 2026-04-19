@@ -107,6 +107,7 @@ pub struct StoredKino {
 /// corresponding event in the hot ledger (`.kinora/hot/<ab>/<event-hash>.jsonl`).
 /// Idempotent at the event-hash level: re-storing the same logical event
 /// is a no-op on disk and returns `was_new_lineage=false`.
+#[fastrace::trace]
 pub fn store_kino(
     kinora_root: &Path,
     params: StoreKinoParams,

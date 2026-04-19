@@ -120,6 +120,7 @@ impl Resolver {
     /// Reads both the new hot layout (`hot/<ab>/<event-hash>.jsonl`) and the
     /// legacy per-lineage layout (`ledger/<lineage>.jsonl`) and unions them,
     /// deduping by event hash. Events are grouped by `id`; heads precomputed.
+    #[fastrace::trace]
     pub fn load(kinora_root: impl Into<std::path::PathBuf>) -> Result<Self, ResolveError> {
         let kinora_root = kinora_root.into();
         let ledger = Ledger::new(&kinora_root);

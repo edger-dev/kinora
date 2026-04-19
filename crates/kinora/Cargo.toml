@@ -13,8 +13,10 @@ blake3 = { workspace = true }
 facet = { workspace = true }
 facet-json = { workspace = true }
 facet-styx = { workspace = true }
+fastrace = { workspace = true }
 gix = { workspace = true }
 jiff = { workspace = true }
+log = { workspace = true }
 
 [dev-dependencies]
 rstest = { workspace = true }

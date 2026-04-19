@@ -164,6 +164,7 @@ impl Ledger {
     /// Does **not** read the legacy `.kinora/ledger/` layout — use
     /// `read_all_lineages` for that. Callers that need both should call both
     /// and merge.
+    #[fastrace::trace]
     pub fn read_all_events(&self) -> Result<Vec<Event>, LedgerError> {
         let dir = hot_dir(&self.kinora_root);
         if !dir.exists() {
