@@ -5,7 +5,7 @@ status: in-progress
 type: task
 priority: low
 created_at: 2026-04-19T06:23:45Z
-updated_at: 2026-04-19T08:14:21Z
+updated_at: 2026-04-19T08:24:47Z
 parent: kinora-w7w0
 ---
 
@@ -16,8 +16,8 @@ Observed while completing kinora-ve9g. Not urgent — pages still render and rea
 ## Acceptance
 
 - [x] Decide what grouping means under hot-ledger — **per-root** (see Resolution below)
-- [ ] Update `render` to derive labels from event metadata or drop the grouping when not meaningful
-- [ ] Test covers both pure-hot and mixed hot+legacy repos
+- [x] Update `render` to derive labels from event metadata or drop the grouping when not meaningful
+- [x] Test covers both pure-hot and mixed hot+legacy repos
 
 ## Notes
 
@@ -65,13 +65,13 @@ Group rendered pages by **owning root**. Under xi21 §7–§8 ownership is exclu
 
 This bean can land in phase 2 — it doesn't block on kinora-hxmw. The `unreferenced/` bucket is how pre-compact kinos are handled today; phase 3 will shrink that bucket by auto-assigning to `inbox` but won't change the render code paths.
 
-- [ ] Swap `current_branch_label` for a roots-pointer reader
-- [ ] Build `owners: HashMap<id, root_name>` by reading each root's entries
-- [ ] Kinos not in any root → `"unreferenced"` bucket
-- [ ] Render groups pages under `src/<root-name>/` in the mdBook
-- [ ] Test: pure-hot repo with no compact → all pages under `unreferenced/`
-- [ ] Test: single `main` root post-compact → all pages under `main/`
-- [ ] Test: mixed (some compacted, some not) → correct split between root name and `unreferenced/`
+- [x] Swap `current_branch_label` for a roots-pointer reader
+- [x] Build `owners: HashMap<id, root_name>` by reading each root's entries
+- [x] Kinos not in any root → `"unreferenced"` bucket
+- [x] Render groups pages under `src/<root-name>/` in the mdBook
+- [x] Test: pure-hot repo with no compact → all pages under `unreferenced/`
+- [x] Test: single `main` root post-compact → all pages under `main/`
+- [x] Test: mixed (some compacted, some not) → correct split between root name and `unreferenced/`
 
 ## Plan
 

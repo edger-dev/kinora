@@ -1,11 +1,15 @@
 use std::collections::HashMap;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use kinora::cache_path::CachePath;
+use kinora::compact::read_root_pointer;
 use kinora::config::Config;
-use kinora::paths::{config_path, kinora_root};
+use kinora::paths::{config_path, kinora_root, roots_dir};
 use kinora::render::{render, write_book};
 use kinora::resolve::Resolver;
+use kinora::root::RootKinograph;
+use kinora::store::ContentStore;
 
 use crate::common::{find_repo_root, CliError};
 
@@ -75,10 +79,40 @@ fn resolve_cache_root(xdg: Option<&str>, home: Option<&str>) -> Result<PathBuf, 
 /// referenced root kinograph blob and records every entry id under that
 /// root's name. Kinos that are not owned by any compacted root are left
 /// out — callers should fall back to a default label for them.
-fn build_owners_map(_kin_root: &Path) -> Result<HashMap<String, String>, CliError> {
-    // STUB (ml4t-commit-1): always returns empty. Commit 2 replaces this
-    // with the real pointer-file scan + RootKinograph parse.
-    Ok(HashMap::new())
+fn build_owners_map(kin_root: &Path) -> Result<HashMap<String, String>, CliError> {
+    let mut owners: HashMap<String, String> = HashMap::new();
+    let dir = roots_dir(kin_root);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(it) => it,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(owners),
+        Err(e) => return Err(CliError::Io(e)),
+    };
+
+    let store = ContentStore::new(kin_root);
+    for entry in entries {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if !file_type.is_file() {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let Some(root_name) = file_name.to_str() else {
+            continue;
+        };
+        // Skip the `.<name>.tmp` files `write_root_pointer` creates mid-rename.
+        if root_name.starts_with('.') {
+            continue;
+        }
+        let Some(hash) = read_root_pointer(kin_root, root_name)? else {
+            continue;
+        };
+        let bytes = store.read(&hash).map_err(CliError::Store)?;
+        let kinograph = RootKinograph::parse(&bytes).map_err(CliError::Root)?;
+        for kino in kinograph.entries {
+            owners.insert(kino.id, root_name.to_owned());
+        }
+    }
+    Ok(owners)
 }
 
 #[cfg(test)]

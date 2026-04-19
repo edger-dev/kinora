@@ -147,7 +147,9 @@ pub fn render(
             Err(e) => return Err(RenderError::Resolve(e)),
         };
         let kind = resolved.head.kind.clone();
-        // STUB (ml4t-commit-1): root-kind skip not yet implemented.
+        if kind == "root" {
+            continue;
+        }
         let name = resolved
             .head
             .metadata
@@ -172,9 +174,10 @@ pub fn render(
             } else {
                 name.clone()
             };
-            // STUB (ml4t-commit-1): always uses default_label, ignoring map.
-            let _ = labels;
-            let group = default_label.to_owned();
+            let group = labels
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| default_label.to_owned());
             RenderedPage {
                 id,
                 slug,

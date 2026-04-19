@@ -10,6 +10,8 @@ use kinora::ledger::LedgerError;
 use kinora::paths::KINORA_DIR;
 use kinora::render::RenderError;
 use kinora::resolve::ResolveError;
+use kinora::root::RootError;
+use kinora::store::StoreError;
 
 #[derive(Debug)]
 pub enum CliError {
@@ -26,6 +28,8 @@ pub enum CliError {
     Render(RenderError),
     Ledger(LedgerError),
     Compact(CompactError),
+    Store(StoreError),
+    Root(RootError),
 }
 
 impl fmt::Display for CliError {
@@ -60,6 +64,8 @@ impl fmt::Display for CliError {
             CliError::Render(e) => write!(f, "{e}"),
             CliError::Ledger(e) => write!(f, "{e}"),
             CliError::Compact(e) => write!(f, "{e}"),
+            CliError::Store(e) => write!(f, "{e}"),
+            CliError::Root(e) => write!(f, "{e}"),
         }
     }
 }
