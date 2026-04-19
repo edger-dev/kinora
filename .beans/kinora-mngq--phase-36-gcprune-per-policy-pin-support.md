@@ -1,11 +1,11 @@
 ---
 # kinora-mngq
 title: 'Phase 3.6: GC/prune per policy + pin support'
-status: in-progress
+status: completed
 type: task
 priority: normal
 created_at: 2026-04-19T10:18:49Z
-updated_at: 2026-04-19T12:34:07Z
+updated_at: 2026-04-19T12:38:10Z
 parent: kinora-hxmw
 blocked_by:
     - kinora-c48l
@@ -44,8 +44,8 @@ Sixth piece of phase 3 (kinora-hxmw). Enforces the per-root retention policies d
 
 - [x] All sub-points under "In scope" implemented with tests
 - [x] Zero compiler warnings
-- [ ] Bean todo items all checked off
-- [ ] Summary of Changes section added at completion
+- [x] Bean todo items all checked off
+- [x] Summary of Changes section added at completion
 
 ## Plan
 
@@ -83,3 +83,44 @@ Sixth piece of phase 3 (kinora-hxmw). Enforces the per-root retention policies d
 1. `test(compact): mngq GC/prune/pin — failing tests`
 2. `feat(compact): policy-driven GC + hot-ledger pruning + pin propagation`
 3. (optional) review-fix commit
+
+## Summary of Changes
+
+Three commits on branch `main`:
+
+1. `a2efd0d test(compact): mngq GC/prune/pin — failing tests`
+2. `38cfeb7 feat(compact): policy-driven GC + hot-ledger pruning + pin propagation`
+3. `5b75cda fix(compact): review fixes for mngq — docs + test gaps`
+
+### Library (`crates/kinora/src/compact.rs`, `crates/kinora/src/config.rs`)
+
+- `RootPolicy::max_age_seconds()` converts the raw duration into seconds (`y=365d`, `w=7d`, `d=24h`, `h=60m`, `m=60s`, `s=1`). Uses `checked_mul` — max is ~290k years, safely bounded.
+- `compact_root` now threads the per-root policy through three new stages:
+  1. **`propagate_pins`** — copies `pin`+`version` from prior root entries to the rebuilt root for kinos still owned. Pin wins over head (a pin freezes `version` even when rebuild would otherwise bump). Ownership wins over pin on cross-root moves (routing already excluded reassigned kinos from the rebuild).
+  2. **`apply_root_entry_gc`** — for `MaxAge(d)`, drops unpinned entries whose head event's `ts` is older than `params.ts - d`. `Never` / `KeepLastN` no-op on the root view (KeepLastN is a hot-ledger concept — the root view has at most one entry per kino by `pick_head`).
+  3. **`prune_hot_events`** — after the pointer write, drops own-root events per policy. Ownership is the routing decision: store events routed to this root + assigns with `target_root == this_root` (live or superseded). `MaxAge` drops old store events + old assigns; `KeepLastN` sorts per-kino-id by ts desc and drops past index N (assigns not touched — only store versions have an N-window). Pinned versions protected on both paths. Root-kind events never pruned — they form the compact parent chain.
+- `parse_ts` wraps `jiff::Timestamp::from_str` and surfaces errors through `CompactError::Event(EventError::Parse)`.
+- Hot prune runs even on no-op compacts — a no-op is still a "successful" compact and the policy must still enforce its retention window.
+
+### Tests (`crates/kinora/src/compact.rs`)
+
+Nine new tests:
+- `never_policy_keeps_root_entry_no_matter_how_old`
+- `max_age_policy_drops_old_unpinned_entry_but_keeps_recent`
+- `max_age_policy_pin_exempts_old_entry_from_drop`
+- `max_age_hot_ledger_prunes_events_older_than_policy`
+- `keep_last_n_keeps_only_n_most_recent_hot_events_per_kino`
+- `keep_last_n_pin_on_version_1_survives_plus_three_newest` (uses `never` → `keep-last-3` policy swap so pin lands before the pruning compact)
+- `fresh_hot_events_untouched_by_policy`
+- `pin_in_root_a_is_dropped_when_kino_is_reassigned_to_root_b` (review-fix)
+- `max_age_prunes_old_assign_events_too` (review-fix)
+
+Plus four test helpers: `overwrite_root_with_pin` (simulates a hand-edit that pins an entry), `hot_event_count`, `hot_event_exists` (keyed on `event.event_hash()` — the JSON-line hash — not `event.hash`), and `store_chain` (author a linear version chain under one kino id).
+
+### Review
+
+Fresh-eyes subagent review on `a2efd0d..38cfeb7` found no blockers. Review-fix commit addressed two test gaps (cross-root pin drop, MaxAge assign prune) and clarified the `propagate_pins` doc comment about the pin-wins-over-head ordering.
+
+### Tests
+
+296 library + 77 CLI tests pass, zero compiler warnings.
