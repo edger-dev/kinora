@@ -262,7 +262,9 @@ impl ExternalRefs {
                 Err(e) => {
                     log::debug!(
                         target: "kinora::compact::refs",
-                        "skip root {source_root:?}: unreadable pointer: {e}",
+                        source_root = source_root.as_str(),
+                        error:% = e;
+                        "skip root: unreadable pointer",
                     );
                     continue;
                 }
@@ -272,8 +274,10 @@ impl ExternalRefs {
                 Err(e) => {
                     log::debug!(
                         target: "kinora::compact::refs",
-                        "skip root {source_root:?}: missing root blob {}: {e}",
-                        root_ptr.as_hex(),
+                        source_root = source_root.as_str(),
+                        root_hash = root_ptr.as_hex(),
+                        error:% = e;
+                        "skip root: missing root blob",
                     );
                     continue;
                 }
@@ -283,8 +287,10 @@ impl ExternalRefs {
                 Err(e) => {
                     log::debug!(
                         target: "kinora::compact::refs",
-                        "skip root {source_root:?}: root blob {} did not parse: {e}",
-                        root_ptr.as_hex(),
+                        source_root = source_root.as_str(),
+                        root_hash = root_ptr.as_hex(),
+                        error:% = e;
+                        "skip root: root blob did not parse",
                     );
                     continue;
                 }
@@ -298,8 +304,10 @@ impl ExternalRefs {
                     Err(e) => {
                         log::debug!(
                             target: "kinora::compact::refs",
-                            "skip entry in {source_root:?}: invalid version hash {:?}: {e}",
-                            entry.version,
+                            source_root = source_root.as_str(),
+                            version = entry.version.as_str(),
+                            error:% = e;
+                            "skip entry: invalid version hash",
                         );
                         continue;
                     }
@@ -309,8 +317,10 @@ impl ExternalRefs {
                     Err(e) => {
                         log::debug!(
                             target: "kinora::compact::refs",
-                            "skip entry in {source_root:?}: missing kinograph blob {}: {e}",
-                            entry.version,
+                            source_root = source_root.as_str(),
+                            version = entry.version.as_str(),
+                            error:% = e;
+                            "skip entry: missing kinograph blob",
                         );
                         continue;
                     }
@@ -320,8 +330,10 @@ impl ExternalRefs {
                     Err(e) => {
                         log::debug!(
                             target: "kinora::compact::refs",
-                            "skip entry in {source_root:?}: kinograph {} did not parse: {e}",
-                            entry.version,
+                            source_root = source_root.as_str(),
+                            version = entry.version.as_str(),
+                            error:% = e;
+                            "skip entry: kinograph did not parse",
                         );
                         continue;
                     }
@@ -338,8 +350,10 @@ impl ExternalRefs {
                             Err(e) => {
                                 log::debug!(
                                     target: "kinora::compact::refs",
-                                    "skip comp {} in {source_root:?}: head pick failed: {e}",
-                                    comp.id,
+                                    source_root = source_root.as_str(),
+                                    kino_id = comp.id.as_str(),
+                                    error:% = e;
+                                    "skip comp: head pick failed",
                                 );
                                 continue;
                             }
@@ -870,10 +884,12 @@ fn apply_root_entry_gc(
             Err(e) => {
                 log::warn!(
                     target: "kinora::compact::gc",
-                    "root={root_name:?} entry id={:?} version={:?}: unparseable head ts {:?}; keeping entry: {e}",
-                    entry.id,
-                    entry.version,
-                    head.ts,
+                    root = root_name,
+                    kino_id = entry.id.as_str(),
+                    version = entry.version.as_str(),
+                    ts = head.ts.as_str(),
+                    error:% = e;
+                    "unparseable head ts; keeping entry",
                 );
                 false
             }
@@ -1009,10 +1025,12 @@ fn prune_hot_events(
                         Err(err) => {
                             log::warn!(
                                 target: "kinora::compact::prune",
-                                "root={root_name:?} store event id={:?} hash={:?}: unparseable ts {:?}; keeping event: {err}",
-                                e.id,
-                                e.hash,
-                                e.ts,
+                                root = root_name,
+                                kino_id = e.id.as_str(),
+                                hash = e.hash.as_str(),
+                                ts = e.ts.as_str(),
+                                error:% = err;
+                                "store event: unparseable ts; keeping event",
                             );
                             continue;
                         }
@@ -1030,9 +1048,11 @@ fn prune_hot_events(
                     Err(err) => {
                         log::warn!(
                             target: "kinora::compact::prune",
-                            "root={root_name:?} assign event hash={:?}: unparseable ts {:?}; keeping event: {err}",
-                            e.hash,
-                            e.ts,
+                            root = root_name,
+                            hash = e.hash.as_str(),
+                            ts = e.ts.as_str(),
+                            error:% = err;
+                            "assign event: unparseable ts; keeping event",
                         );
                         continue;
                     }
