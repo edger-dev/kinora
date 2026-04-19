@@ -2017,4 +2017,226 @@ roots {
             "fresh assign event must survive"
         );
     }
+
+    // ------------------------------------------------------------------
+    // f0rg: cross-root integrity (external refs prevent GC drops)
+    // ------------------------------------------------------------------
+
+    use crate::kinograph::{Entry as KinographEntry, Kinograph};
+
+    /// Store a kinograph-kind kino composing the given entries. Returns
+    /// the `Event` for the composition's store event.
+    fn store_kinograph(
+        kin: &Path,
+        entries: Vec<KinographEntry>,
+        name: &str,
+        ts: &str,
+    ) -> Event {
+        let k = Kinograph { entries };
+        let content = k.to_styx().unwrap().into_bytes();
+        let stored = store_kino(
+            kin,
+            StoreKinoParams {
+                kind: "kinograph".into(),
+                content,
+                author: "yj".into(),
+                provenance: "f0rg-test".into(),
+                ts: ts.into(),
+                metadata: BTreeMap::from([("name".into(), name.into())]),
+                id: None,
+                parents: vec![],
+            },
+        )
+        .unwrap();
+        stored.event
+    }
+
+    #[test]
+    fn cross_root_ref_from_a_prevents_b_gc_from_dropping_referenced_version() {
+        let (_t, root) = setup();
+        write_config(
+            &root,
+            r#"repo-url "https://example.com/x.git"
+roots {
+  rfcs { policy "never" }
+  inbox-b { policy "30d" }
+}
+"#,
+        );
+        // X is 40 days old. Policy on inbox-b is 30d, so X would normally
+        // drop. But a kinograph in rfcs composes X — integrity must save it.
+        let x = store_md(&root, b"x body", "x", "2026-03-10T10:00:00Z");
+        write_assign_for(&root, &x.id, "inbox-b", vec![], "2026-03-10T10:00:01Z");
+        // Composition kinograph in rfcs pins to X's specific version.
+        let kg_entry = KinographEntry {
+            id: x.id.clone(),
+            name: String::new(),
+            pin: x.hash.clone(),
+            note: String::new(),
+        };
+        let kg = store_kinograph(&root, vec![kg_entry], "my-list", "2026-04-10T10:00:00Z");
+        write_assign_for(&root, &kg.id, "rfcs", vec![], "2026-04-10T10:00:01Z");
+
+        // Compact both roots. B's 30d policy would drop X, but rfcs' kg
+        // references it → integrity holds X.
+        let rfcs_res =
+            compact_root(&root, "rfcs", params("yj", "2026-04-19T12:00:00Z")).unwrap();
+        let b_res =
+            compact_root(&root, "inbox-b", params("yj", "2026-04-19T12:00:00Z")).unwrap();
+        let rfcs_ids = root_ids(&root, &rfcs_res.new_version.unwrap());
+        let b_ids = root_ids(&root, &b_res.new_version.unwrap());
+        assert_eq!(rfcs_ids, vec![kg.id], "rfcs keeps its kinograph");
+        assert_eq!(
+            b_ids,
+            vec![x.id.clone()],
+            "inbox-b must NOT drop X — rfcs composes it"
+        );
+        // X's store event must also survive the hot prune.
+        assert!(
+            hot_event_exists(&root, &x),
+            "X's hot event must be protected by the external ref"
+        );
+    }
+
+    #[test]
+    fn removing_cross_root_reference_allows_subsequent_gc_drop() {
+        let (_t, root) = setup();
+        write_config(
+            &root,
+            r#"repo-url "https://example.com/x.git"
+roots {
+  rfcs { policy "never" }
+  inbox-b { policy "30d" }
+}
+"#,
+        );
+        let x = store_md(&root, b"x body", "x", "2026-03-10T10:00:00Z");
+        write_assign_for(&root, &x.id, "inbox-b", vec![], "2026-03-10T10:00:01Z");
+        let y = store_md(&root, b"y body", "y", "2026-04-10T09:00:00Z");
+        write_assign_for(&root, &y.id, "inbox-b", vec![], "2026-04-10T09:00:01Z");
+
+        // v1 of the kinograph references X.
+        let kg_v1 = store_kinograph(
+            &root,
+            vec![KinographEntry {
+                id: x.id.clone(),
+                name: String::new(),
+                pin: x.hash.clone(),
+                note: String::new(),
+            }],
+            "my-list",
+            "2026-04-10T10:00:00Z",
+        );
+        write_assign_for(&root, &kg_v1.id, "rfcs", vec![], "2026-04-10T10:00:01Z");
+        compact_root(&root, "rfcs", params("yj", "2026-04-11T10:00:00Z")).unwrap();
+        compact_root(&root, "inbox-b", params("yj", "2026-04-11T10:00:00Z")).unwrap();
+
+        // v2 of the kinograph replaces X with Y.
+        let kg_v2_k = Kinograph {
+            entries: vec![KinographEntry {
+                id: y.id.clone(),
+                name: String::new(),
+                pin: y.hash.clone(),
+                note: String::new(),
+            }],
+        };
+        let stored = store_kino(
+            &root,
+            StoreKinoParams {
+                kind: "kinograph".into(),
+                content: kg_v2_k.to_styx().unwrap().into_bytes(),
+                author: "yj".into(),
+                provenance: "f0rg-test".into(),
+                ts: "2026-04-15T10:00:00Z".into(),
+                metadata: BTreeMap::from([("name".into(), "my-list".into())]),
+                id: Some(kg_v1.id.clone()),
+                parents: vec![kg_v1.hash.clone()],
+            },
+        )
+        .unwrap();
+        let _kg_v2 = stored.event;
+
+        // Compact both roots again. rfcs now refs Y, not X. X is ONLY
+        // owned by inbox-b, 40d old, no cross-root protection → drop.
+        compact_root(&root, "rfcs", params("yj", "2026-04-19T12:00:00Z")).unwrap();
+        let b_res =
+            compact_root(&root, "inbox-b", params("yj", "2026-04-19T12:00:00Z")).unwrap();
+        let b_ids = root_ids(&root, &b_res.new_version.unwrap());
+        assert!(
+            !b_ids.contains(&x.id),
+            "X no longer referenced; must drop under 30d policy"
+        );
+        assert!(b_ids.contains(&y.id), "Y is fresh and still referenced");
+    }
+
+    #[test]
+    fn circular_cross_root_references_do_not_loop() {
+        let (_t, root) = setup();
+        write_config(
+            &root,
+            r#"repo-url "https://example.com/x.git"
+roots {
+  ra { policy "30d" }
+  rb { policy "30d" }
+}
+"#,
+        );
+        // Two kinographs, each in a different root, each eventually
+        // referencing the other. We build them in two stages because the
+        // first one's id isn't known until it's stored.
+        let stub = store_md(&root, b"stub", "stub", "2026-04-10T10:00:00Z");
+        let kg_a = store_kinograph(
+            &root,
+            vec![KinographEntry {
+                id: stub.id.clone(),
+                name: String::new(),
+                pin: stub.hash.clone(),
+                note: String::new(),
+            }],
+            "kg-a",
+            "2026-04-10T10:00:01Z",
+        );
+        write_assign_for(&root, &kg_a.id, "ra", vec![], "2026-04-10T10:00:02Z");
+        let kg_b = store_kinograph(
+            &root,
+            vec![KinographEntry {
+                id: kg_a.id.clone(),
+                name: String::new(),
+                pin: kg_a.hash.clone(),
+                note: String::new(),
+            }],
+            "kg-b",
+            "2026-04-10T10:00:03Z",
+        );
+        write_assign_for(&root, &kg_b.id, "rb", vec![], "2026-04-10T10:00:04Z");
+        // Now create a second version of kg_a that references kg_b — closes the cycle.
+        let kg_a_v2_content = Kinograph {
+            entries: vec![KinographEntry {
+                id: kg_b.id.clone(),
+                name: String::new(),
+                pin: kg_b.hash.clone(),
+                note: String::new(),
+            }],
+        };
+        store_kino(
+            &root,
+            StoreKinoParams {
+                kind: "kinograph".into(),
+                content: kg_a_v2_content.to_styx().unwrap().into_bytes(),
+                author: "yj".into(),
+                provenance: "f0rg-test".into(),
+                ts: "2026-04-10T10:00:05Z".into(),
+                metadata: BTreeMap::from([("name".into(), "kg-a".into())]),
+                id: Some(kg_a.id.clone()),
+                parents: vec![kg_a.hash.clone()],
+            },
+        )
+        .unwrap();
+
+        // Both compacts must terminate cleanly.
+        let a_res = compact_root(&root, "ra", params("yj", "2026-04-19T12:00:00Z")).unwrap();
+        let b_res = compact_root(&root, "rb", params("yj", "2026-04-19T12:00:00Z")).unwrap();
+        assert!(a_res.new_version.is_some());
+        assert!(b_res.new_version.is_some());
+    }
 }
