@@ -77,6 +77,10 @@ pub fn render_compact_entry<W: Write>(w: &mut W, entry: &CompactAllEntry) -> io:
 /// `UnknownRoot` get the D2 multi-line format so the user sees the
 /// candidates and a copy-pasteable resolution hint; other variants fall
 /// back to a single `root=X ERROR: <display>` line.
+///
+/// Note the intentional double-space after `root=<name>` for the two
+/// structured variants — matches the D2 mock-up in bean 7mou and flags
+/// these (fixable) config/user errors against the generic fallback.
 pub fn render_compact_error<W: Write>(
     w: &mut W,
     root_name: &str,
