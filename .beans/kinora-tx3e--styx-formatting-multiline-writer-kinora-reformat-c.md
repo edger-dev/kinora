@@ -5,7 +5,7 @@ status: in-progress
 type: feature
 priority: normal
 created_at: 2026-04-19T15:12:02Z
-updated_at: 2026-04-19T18:43:26Z
+updated_at: 2026-04-19T18:49:54Z
 blocked_by:
     - kinora-jezf
 ---
@@ -205,11 +205,11 @@ YAGNI today — kinograph has only ever been `{ entries: Vec<Entry> }`. If we ev
 
 ### Revised Todos
 
-- [ ] Add `Kinograph::to_styxl` and `Kinograph::parse_styxl` in `kinograph.rs`; switch internal callers
-- [ ] Add `RootKinograph::to_styxl` and `RootKinograph::parse_styxl` in `root.rs`; switch internal callers
-- [ ] Switch kinograph-kind writes to produce `.styxl` blobs (update kind → extension mapping)
-- [ ] Tests: round-trip, empty entries, edge cases (escaped strings, long metadata)
-- [ ] Tests: per-line parsing independence (corrupt one line, others still load via a recovery path — or hard-fail cleanly; pick one and document)
+- [x] Add `Kinograph::to_styxl` and `Kinograph::parse_styxl` in `kinograph.rs`; switch internal callers
+- [x] Add `RootKinograph::to_styxl` and `RootKinograph::parse_styxl` in `root.rs`; switch internal callers
+- [x] Switch kinograph-kind writes to produce `.styxl` blobs (update kind → extension mapping)
+- [x] Tests: round-trip, empty entries, edge cases (escaped strings, long metadata)
+- [x] Tests: per-line parsing independence (corrupt one line, others still load via a recovery path — or hard-fail cleanly; pick one and document)
 - [ ] Implement `kinora reformat`: walk reachable kinograph kinos, rewrite from `.styx` wrapped to `.styxl`, stage new-version events
 - [ ] Tests: reformat over a repo with legacy `.styx` kinos; idempotent after
 

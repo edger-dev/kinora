@@ -81,19 +81,16 @@ impl RootKinograph {
         Self::parse_str(s)
     }
 
+    /// Parse a root-kinograph blob. Accepts both the new styxl form
+    /// (one entry per line, no outer wrapper) and the legacy wrapped
+    /// `entries (…)` form. Auto-detects by the first non-blank char.
     pub fn parse_str(input: &str) -> Result<Self, RootError> {
+        if crate::kinograph::is_styxl(input) {
+            return Self::parse_styxl(input);
+        }
         let parsed: RootKinograph = facet_styx::from_str(input)
             .map_err(|e| RootError::Parse(e.to_string()))?;
-        let mut seen: HashSet<String> = HashSet::new();
-        for (idx, entry) in parsed.entries.iter().enumerate() {
-            validate_entry(idx, entry)?;
-            if !seen.insert(entry.id.clone()) {
-                return Err(RootError::DuplicateId {
-                    idx,
-                    id: entry.id.clone(),
-                });
-            }
-        }
+        validate_and_check_duplicates(&parsed.entries)?;
         Ok(parsed)
     }
 
@@ -104,6 +101,59 @@ impl RootKinograph {
         canonical.entries.sort_by(|a, b| a.id.cmp(&b.id));
         facet_styx::to_string(&canonical).map_err(|e| RootError::Serialize(e.to_string()))
     }
+
+    /// Canonical styxl: entries sorted by `id`, one per line. Empty
+    /// root serializes to the empty string. A trailing LF is written
+    /// after the last entry for naive concatenation compatibility.
+    ///
+    /// Uses `facet_styx::to_string_compact` so each entry serializes
+    /// as a wrapped `{…}` struct on one line; the default `to_string`
+    /// would unwrap the root struct into multi-line key-value pairs.
+    pub fn to_styxl(&self) -> Result<String, RootError> {
+        let mut canonical: Vec<RootEntry> = self.entries.clone();
+        canonical.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut out = String::new();
+        for entry in &canonical {
+            let line = facet_styx::to_string_compact(entry)
+                .map_err(|e| RootError::Serialize(e.to_string()))?;
+            out.push_str(&line);
+            out.push('\n');
+        }
+        Ok(out)
+    }
+
+    /// Parse styxl: split on LF, skip blank lines, parse each line as
+    /// a `RootEntry`. Validates each entry and rejects duplicate ids.
+    /// Reports 1-based line numbers on parse failure.
+    pub fn parse_styxl(input: &str) -> Result<Self, RootError> {
+        let mut entries: Vec<RootEntry> = Vec::new();
+        for (idx, raw) in input.split('\n').enumerate() {
+            let line = raw.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let entry: RootEntry = facet_styx::from_str(line).map_err(|e| {
+                RootError::Parse(format!("line {}: {e}", idx + 1))
+            })?;
+            entries.push(entry);
+        }
+        validate_and_check_duplicates(&entries)?;
+        Ok(Self { entries })
+    }
+}
+
+fn validate_and_check_duplicates(entries: &[RootEntry]) -> Result<(), RootError> {
+    let mut seen: HashSet<String> = HashSet::new();
+    for (idx, entry) in entries.iter().enumerate() {
+        validate_entry(idx, entry)?;
+        if !seen.insert(entry.id.clone()) {
+            return Err(RootError::DuplicateId {
+                idx,
+                id: entry.id.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn validate_entry(idx: usize, entry: &RootEntry) -> Result<(), RootError> {
@@ -412,7 +462,7 @@ mod tests {
             .map(|l| {
                 // extract the id hex right after `{id `
                 let rest = l.strip_prefix("{id ").expect("line starts with {id ");
-                rest.split(|c: char| c == ',' || c == '}').next().unwrap().trim().to_owned()
+                rest.split([',', '}']).next().unwrap().trim().to_owned()
             })
             .collect();
         assert_eq!(first_ids, vec![id(1), id(2), id(3)]);

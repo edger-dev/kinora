@@ -634,7 +634,7 @@ fn commit_root_with_refs(
         refs,
     )?;
 
-    let new_bytes = root.to_styx()?.into_bytes();
+    let new_bytes = root.to_styxl()?.into_bytes();
 
     let result = match &prior_version {
         Some(prior) => {

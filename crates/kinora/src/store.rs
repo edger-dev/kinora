@@ -172,7 +172,7 @@ mod tests {
     #[test]
     fn write_uses_kind_derived_extension() {
         let (_tmp, store) = store();
-        for (kind, ext) in [("markdown", Some("md")), ("text", Some("txt")), ("kinograph", Some("styx"))] {
+        for (kind, ext) in [("markdown", Some("md")), ("text", Some("txt")), ("kinograph", Some("styxl"))] {
             let content = format!("content-for-{kind}").into_bytes();
             let hash = store.write(kind, &content).unwrap();
             let path = find_blob_path(store.root(), &hash).unwrap();

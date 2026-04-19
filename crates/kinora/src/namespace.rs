@@ -79,8 +79,8 @@ pub fn ext_for_kind(kind: &str) -> Option<&'static str> {
     match kind {
         "markdown" => Some("md"),
         "text" => Some("txt"),
-        "kinograph" => Some("styx"),
-        "root" => Some("styx"),
+        "kinograph" => Some("styxl"),
+        "root" => Some("styxl"),
         "commit-archive" => Some("jsonl"),
         "binary" => None,
         _ => None,
@@ -163,8 +163,8 @@ mod tests {
     fn ext_for_kind_maps_reserved_kinds() {
         assert_eq!(ext_for_kind("markdown"), Some("md"));
         assert_eq!(ext_for_kind("text"), Some("txt"));
-        assert_eq!(ext_for_kind("kinograph"), Some("styx"));
-        assert_eq!(ext_for_kind("root"), Some("styx"));
+        assert_eq!(ext_for_kind("kinograph"), Some("styxl"));
+        assert_eq!(ext_for_kind("root"), Some("styxl"));
         assert_eq!(ext_for_kind("commit-archive"), Some("jsonl"));
         assert_eq!(ext_for_kind("binary"), None);
     }

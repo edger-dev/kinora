@@ -80,7 +80,16 @@ impl Kinograph {
         Self::parse_str(s)
     }
 
+    /// Parse a kinograph document, accepting either the new styxl (one
+    /// entry per line, no outer wrapper) or the legacy wrapped form
+    /// (`entries (…)`). Auto-detects by peeking at the first non-blank
+    /// character — `{` means styxl, anything else goes through the
+    /// wrapped parser. Keeps call sites format-agnostic during the
+    /// migration window.
     pub fn parse_str(input: &str) -> Result<Self, KinographError> {
+        if is_styxl(input) {
+            return Self::parse_styxl(input);
+        }
         let parsed: Kinograph = facet_styx::from_str(input)
             .map_err(|e| KinographError::Parse(e.to_string()))?;
         for (idx, entry) in parsed.entries.iter().enumerate() {
@@ -91,6 +100,45 @@ impl Kinograph {
 
     pub fn to_styx(&self) -> Result<String, KinographError> {
         facet_styx::to_string(self).map_err(|e| KinographError::Serialize(e.to_string()))
+    }
+
+    /// Serialize to styxl: one entry per line, each a standalone inline
+    /// styx document with no outer `entries (…)` wrapper. Emits a
+    /// trailing LF after the last entry so naive concatenation produces
+    /// a clean file. An empty kinograph yields the empty string.
+    ///
+    /// Uses `facet_styx::to_string_compact` so each entry comes out as
+    /// `{id …, name "", pin "", note ""}` on a single line; the default
+    /// `to_string` would unwrap the root struct into newline-separated
+    /// fields, which isn't what we want per-line.
+    pub fn to_styxl(&self) -> Result<String, KinographError> {
+        let mut out = String::new();
+        for entry in &self.entries {
+            let line = facet_styx::to_string_compact(entry)
+                .map_err(|e| KinographError::Serialize(e.to_string()))?;
+            out.push_str(&line);
+            out.push('\n');
+        }
+        Ok(out)
+    }
+
+    /// Parse styxl: split on LF, skip blank lines, parse each remaining
+    /// line as a single `Entry`. Reports the 1-based line number on
+    /// parse failure so downstream errors can cite the bad input.
+    pub fn parse_styxl(input: &str) -> Result<Self, KinographError> {
+        let mut entries = Vec::new();
+        for (idx, raw) in input.split('\n').enumerate() {
+            let line = raw.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let entry: Entry = facet_styx::from_str(line).map_err(|e| {
+                KinographError::Parse(format!("line {}: {e}", idx + 1))
+            })?;
+            validate_entry(entries.len(), &entry)?;
+            entries.push(entry);
+        }
+        Ok(Self { entries })
     }
 
     /// For each entry whose `id` is not a valid 64-hex hash, treat it
@@ -156,6 +204,21 @@ impl Kinograph {
             out.pop();
         }
         Ok(out)
+    }
+}
+
+/// Heuristic: if the first non-whitespace character of a kinograph
+/// document is `{`, treat it as styxl (one entry per line). The
+/// legacy wrapped form always starts with the literal `entries`
+/// keyword, so the first-char check is unambiguous. Empty / all-
+/// whitespace input is also treated as styxl — `to_styxl` of an
+/// empty kinograph produces `""` (not `"entries ()"`), and this
+/// routing lets that round-trip back through `parse`.
+pub(crate) fn is_styxl(input: &str) -> bool {
+    match input.chars().find(|c| !c.is_whitespace()) {
+        None => true,
+        Some('{') => true,
+        Some(_) => false,
     }
 }
 
