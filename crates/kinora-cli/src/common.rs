@@ -1,4 +1,3 @@
-use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -14,121 +13,42 @@ use kinora::resolve::ResolveError;
 use kinora::root::RootError;
 use kinora::store::StoreError;
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum CliError {
-    Io(io::Error),
+    #[error("io error: {0}")]
+    Io(#[from] io::Error),
+    #[error("not in a kinora repo: no `{}/` found above {}", KINORA_DIR, .start.display())]
     NotInKinoraRepo { start: PathBuf },
+    #[error("--metadata expects KEY=VALUE, got `{got}`")]
     InvalidMetadataFlag { got: String },
+    #[error("--draft conflicts with `-m draft=…`; pass only one")]
     ConflictingDraftFlag,
+    #[error("could not resolve author: pass --author NAME or set git `user.name`")]
     AuthorUnresolved,
+    #[error("could not resolve cache root: set $XDG_CACHE_HOME or $HOME, or pass --cache-dir")]
     CacheHomeUnresolved,
+    #[error("--root must be a non-empty root name")]
     EmptyRoot,
-    Config(ConfigError),
-    StoreKino(StoreKinoError),
-    Resolve(ResolveError),
-    Kinograph(KinographError),
-    Render(RenderError),
-    Ledger(LedgerError),
-    Compact(CompactError),
-    Store(StoreError),
-    Root(RootError),
-    Assign(AssignError),
-}
-
-impl fmt::Display for CliError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            CliError::Io(e) => write!(f, "io error: {e}"),
-            CliError::NotInKinoraRepo { start } => write!(
-                f,
-                "not in a kinora repo: no `{KINORA_DIR}/` found above {}",
-                start.display()
-            ),
-            CliError::InvalidMetadataFlag { got } => write!(
-                f,
-                "--metadata expects KEY=VALUE, got `{got}`"
-            ),
-            CliError::ConflictingDraftFlag => write!(
-                f,
-                "--draft conflicts with `-m draft=…`; pass only one"
-            ),
-            CliError::AuthorUnresolved => write!(
-                f,
-                "could not resolve author: pass --author NAME or set git `user.name`"
-            ),
-            CliError::CacheHomeUnresolved => write!(
-                f,
-                "could not resolve cache root: set $XDG_CACHE_HOME or $HOME, or pass --cache-dir"
-            ),
-            CliError::EmptyRoot => write!(f, "--root must be a non-empty root name"),
-            CliError::Config(e) => write!(f, "{e}"),
-            CliError::StoreKino(e) => write!(f, "{e}"),
-            CliError::Resolve(e) => write!(f, "{e}"),
-            CliError::Kinograph(e) => write!(f, "{e}"),
-            CliError::Render(e) => write!(f, "{e}"),
-            CliError::Ledger(e) => write!(f, "{e}"),
-            CliError::Compact(e) => write!(f, "{e}"),
-            CliError::Store(e) => write!(f, "{e}"),
-            CliError::Root(e) => write!(f, "{e}"),
-            CliError::Assign(e) => write!(f, "{e}"),
-        }
-    }
-}
-
-impl std::error::Error for CliError {}
-
-impl From<io::Error> for CliError {
-    fn from(e: io::Error) -> Self {
-        CliError::Io(e)
-    }
-}
-
-impl From<StoreKinoError> for CliError {
-    fn from(e: StoreKinoError) -> Self {
-        CliError::StoreKino(e)
-    }
-}
-
-impl From<ResolveError> for CliError {
-    fn from(e: ResolveError) -> Self {
-        CliError::Resolve(e)
-    }
-}
-
-impl From<KinographError> for CliError {
-    fn from(e: KinographError) -> Self {
-        CliError::Kinograph(e)
-    }
-}
-
-impl From<ConfigError> for CliError {
-    fn from(e: ConfigError) -> Self {
-        CliError::Config(e)
-    }
-}
-
-impl From<RenderError> for CliError {
-    fn from(e: RenderError) -> Self {
-        CliError::Render(e)
-    }
-}
-
-impl From<LedgerError> for CliError {
-    fn from(e: LedgerError) -> Self {
-        CliError::Ledger(e)
-    }
-}
-
-impl From<CompactError> for CliError {
-    fn from(e: CompactError) -> Self {
-        CliError::Compact(e)
-    }
-}
-
-impl From<AssignError> for CliError {
-    fn from(e: AssignError) -> Self {
-        CliError::Assign(e)
-    }
+    #[error(transparent)]
+    Config(#[from] ConfigError),
+    #[error(transparent)]
+    StoreKino(#[from] StoreKinoError),
+    #[error(transparent)]
+    Resolve(#[from] ResolveError),
+    #[error(transparent)]
+    Kinograph(#[from] KinographError),
+    #[error(transparent)]
+    Render(#[from] RenderError),
+    #[error(transparent)]
+    Ledger(#[from] LedgerError),
+    #[error(transparent)]
+    Compact(#[from] CompactError),
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    #[error(transparent)]
+    Root(#[from] RootError),
+    #[error(transparent)]
+    Assign(#[from] AssignError),
 }
 
 /// Walk up from `start` looking for a directory that contains `.kinora/`.

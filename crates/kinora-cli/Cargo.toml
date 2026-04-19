@@ -20,6 +20,8 @@ figue = { workspace = true }
 jiff = { workspace = true }
 log = { workspace = true }
 logforth = { workspace = true, features = ["starter-log", "append-fastrace", "diagnostic-fastrace"] }
+rootcause = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

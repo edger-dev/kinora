@@ -15,6 +15,7 @@ use resolve::{
     head_lineages, render_all_heads, render_fork_report, run_resolve, ResolveOutcome,
     ResolveRunArgs,
 };
+use rootcause::Report;
 use store::{format_store_summary, run_store, StoreRunArgs};
 
 mod assign;
@@ -113,10 +114,7 @@ fn run() -> ExitCode {
                     println!("{}", format_store_summary(&stored));
                     ExitCode::SUCCESS
                 }
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    ExitCode::FAILURE
-                }
+                Err(e) => report_err("store", e),
             }
         }
         Command::Assign { kino, root, resolves, author, provenance } => {
@@ -126,10 +124,7 @@ fn run() -> ExitCode {
                     println!("{}", format_assign_summary(&result));
                     ExitCode::SUCCESS
                 }
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    ExitCode::FAILURE
-                }
+                Err(e) => report_err("assign", e),
             }
         }
         Command::Render { cache_dir } => {
@@ -149,10 +144,7 @@ fn run() -> ExitCode {
                     );
                     ExitCode::SUCCESS
                 }
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    ExitCode::FAILURE
-                }
+                Err(e) => report_err("render", e),
             }
         }
         Command::Compact { author, provenance } => {
@@ -169,10 +161,7 @@ fn run() -> ExitCode {
                         ExitCode::SUCCESS
                     }
                 }
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    ExitCode::FAILURE
-                }
+                Err(e) => report_err("compact", e),
             }
         }
         Command::Resolve { name_or_id, version, all_heads } => {
@@ -204,10 +193,7 @@ fn run() -> ExitCode {
                     let _ = render_fork_report(&mut stderr, &name_or_id, &id, &heads, &lineages);
                     ExitCode::FAILURE
                 }
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    ExitCode::FAILURE
-                }
+                Err(e) => report_err("resolve", e),
             }
         }
     }
@@ -217,4 +203,13 @@ fn kinora_resolver_from_cwd(cwd: &std::path::Path) -> Result<kinora::resolve::Re
     let repo_root = common::find_repo_root(cwd)?;
     let kin_root = kinora::paths::kinora_root(&repo_root);
     Ok(kinora::resolve::Resolver::load(&kin_root)?)
+}
+
+/// Wrap a `CliError` in a `rootcause::Report` with per-command context and
+/// print its chained Debug form to stderr. The child chain (thiserror
+/// `source()` links) appears under the top-level context string.
+fn report_err(command: &'static str, e: common::CliError) -> ExitCode {
+    let report = Report::new_sendsync(e).context(format!("`kinora {command}` failed"));
+    eprintln!("{report}");
+    ExitCode::FAILURE
 }
