@@ -1,11 +1,11 @@
 ---
 # kinora-wpup
 title: 'Store filename: append kind-derived extension (<hash>.<ext>)'
-status: todo
+status: in-progress
 type: task
 priority: normal
 created_at: 2026-04-19T04:21:36Z
-updated_at: 2026-04-19T04:21:36Z
+updated_at: 2026-04-19T06:18:19Z
 parent: kinora-w7w0
 ---
 
@@ -35,11 +35,11 @@ Same content under different kinds still produces one blob (first writer wins on
 
 ## Acceptance
 
-- [ ] `write_content(kind, bytes)` writes to `<hash[..2]>/<hash>.<ext>`
-- [ ] `read_content(hash)` resolves via glob (or equivalent); returns bytes regardless of extension
-- [ ] Existing `.kinora/store/` layouts (extensionless) still readable, or migration noted
-- [ ] Tests cover: roundtrip per kind, glob read, same-content-different-kind dedup, namespaced-kind fallback
-- [ ] RFC-0003 re-import (or migration) produces `.md` on disk
+- [x] `write_content(kind, bytes)` writes to `<hash[..2]>/<hash>.<ext>`
+- [x] `read_content(hash)` resolves via glob (or equivalent); returns bytes regardless of extension
+- [x] Existing `.kinora/store/` layouts (extensionless) still readable, or migration noted
+- [x] Tests cover: roundtrip per kind, glob read, same-content-different-kind dedup, namespaced-kind fallback
+- [~] RFC-0003 re-import (or migration) produces `.md` on disk — explicitly deferred; legacy blobs remain readable via `find_blob_path`, so no automatic migration is needed. Re-storing would duplicate ledger events with new timestamps.
 
 ## Notes
 

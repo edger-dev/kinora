@@ -254,7 +254,7 @@ mod tests {
         let store = ContentStore::new(tmp.path());
         store.ensure_layout().unwrap();
 
-        let stored_hash = store.write(b"prior").unwrap();
+        let stored_hash = store.write("markdown", b"prior").unwrap();
 
         let mut e = version_from(&birth("markdown"));
         e.parents = vec![stored_hash.as_hex().into()];
@@ -284,13 +284,14 @@ mod tests {
 
     #[test]
     fn parent_corruption_detected() {
-        use crate::paths::store_blob_path;
+        use crate::paths::find_blob_path;
         let tmp = TempDir::new().unwrap();
         let store = ContentStore::new(tmp.path());
         store.ensure_layout().unwrap();
 
-        let stored_hash = store.write(b"prior").unwrap();
-        std::fs::write(store_blob_path(store.root(), &stored_hash), b"tampered").unwrap();
+        let stored_hash = store.write("markdown", b"prior").unwrap();
+        let path = find_blob_path(store.root(), &stored_hash).unwrap();
+        std::fs::write(&path, b"tampered").unwrap();
 
         let mut e = version_from(&birth("markdown"));
         e.parents = vec![stored_hash.as_hex().into()];
@@ -300,13 +301,13 @@ mod tests {
 
     #[test]
     fn event_hash_in_store_checks_presence_and_integrity() {
-        use crate::paths::store_blob_path;
+        use crate::paths::find_blob_path;
         let tmp = TempDir::new().unwrap();
         let store = ContentStore::new(tmp.path());
         store.ensure_layout().unwrap();
 
         let content = b"event-content";
-        let h = store.write(content).unwrap();
+        let h = store.write("markdown", content).unwrap();
         let mut e = birth("markdown");
         e.id = h.as_hex().into();
         e.hash = h.as_hex().into();
@@ -321,7 +322,8 @@ mod tests {
         assert!(matches!(err, ValidationError::EventHashNotInStore { .. }));
 
         // corrupted blob
-        std::fs::write(store_blob_path(store.root(), &h), b"tampered").unwrap();
+        let path = find_blob_path(store.root(), &h).unwrap();
+        std::fs::write(&path, b"tampered").unwrap();
         let err = validate_event_hash_in_store(&store, &e).unwrap_err();
         assert!(matches!(err, ValidationError::EventHashCorrupted { .. }));
     }

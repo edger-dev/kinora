@@ -116,7 +116,7 @@ pub fn store_kino(
     let ledger = Ledger::new(kinora_root);
     ledger.ensure_layout()?;
 
-    let hash = store.write(&params.content)?;
+    let hash = store.write(&params.kind, &params.content)?;
     let hash_hex: String = hash.as_hex().into();
 
     let id = match params.id {
@@ -157,7 +157,7 @@ mod tests {
     use super::*;
     use crate::hash::Hash;
     use crate::init::init;
-    use crate::paths::{kinora_root, store_blob_path};
+    use crate::paths::{find_blob_path, kinora_root};
     use std::str::FromStr;
     use tempfile::TempDir;
 
@@ -189,7 +189,7 @@ mod tests {
         assert_eq!(stored.event.id, stored.event.hash);
         assert!(stored.event.parents.is_empty());
         let hash = Hash::from_str(&stored.event.hash).unwrap();
-        assert!(store_blob_path(&root, &hash).exists());
+        assert!(find_blob_path(&root, &hash).is_some());
     }
 
     #[test]
@@ -287,7 +287,7 @@ mod tests {
         let (_tmp, root) = setup();
         let first = store_kino(&root, params("markdown", b"same")).unwrap();
         let hash = Hash::from_str(&first.event.hash).unwrap();
-        let blob_path = store_blob_path(&root, &hash);
+        let blob_path = find_blob_path(&root, &hash).unwrap();
         let mtime_before = std::fs::metadata(&blob_path).unwrap().modified().unwrap();
 
         // Same content, different `ts` → different logical event → different

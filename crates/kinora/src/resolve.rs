@@ -469,7 +469,7 @@ mod tests {
         ledger.ensure_layout().unwrap();
 
         // Birth + v2 sharing one legacy lineage file.
-        let birth_hash = store.write(b"v1").unwrap();
+        let birth_hash = store.write("markdown", b"v1").unwrap();
         let birth = Event {
             kind: "markdown".into(),
             id: birth_hash.as_hex().into(),
@@ -482,7 +482,7 @@ mod tests {
         };
         let sh_a = ledger.mint_and_append(&birth).unwrap();
 
-        let v2_hash = store.write(b"v2").unwrap();
+        let v2_hash = store.write("markdown", b"v2").unwrap();
         let v2 = Event {
             kind: "markdown".into(),
             id: birth.id.clone(),
@@ -497,7 +497,7 @@ mod tests {
 
         // Sibling head in a separate legacy lineage file.
         std::fs::remove_file(crate::paths::head_path(&root)).unwrap();
-        let sibling_hash = store.write(b"right").unwrap();
+        let sibling_hash = store.write("markdown", b"right").unwrap();
         let sibling = Event {
             kind: "markdown".into(),
             id: birth.id.clone(),
@@ -532,7 +532,7 @@ mod tests {
         // Legacy: write a birth event directly to a new lineage file.
         let ledger = Ledger::new(&root);
         let store = ContentStore::new(&root);
-        let legacy_hash = store.write(b"bye").unwrap();
+        let legacy_hash = store.write("markdown", b"bye").unwrap();
         let legacy_event = Event {
             kind: "markdown".into(),
             id: legacy_hash.as_hex().into(),
@@ -563,7 +563,7 @@ mod tests {
         store.ensure_layout().unwrap();
         ledger.ensure_layout().unwrap();
 
-        let content_hash = store.write(b"same").unwrap();
+        let content_hash = store.write("markdown", b"same").unwrap();
         let event = Event {
             kind: "markdown".into(),
             id: content_hash.as_hex().into(),

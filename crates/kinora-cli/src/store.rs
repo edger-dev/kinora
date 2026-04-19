@@ -247,10 +247,11 @@ mod tests {
         kg_args.name = Some("doc".into());
         let stored = run_store(tmp.path(), kg_args).unwrap();
 
-        let blob_path = kinora::paths::store_blob_path(
+        let blob_path = kinora::paths::find_blob_path(
             &kinora_root(tmp.path()),
             &kinora::hash::Hash::from_str(&stored.event.hash).unwrap(),
-        );
+        )
+        .unwrap();
         let written = fs::read_to_string(blob_path).unwrap();
         assert!(
             written.contains(&first.event.id),
@@ -307,10 +308,11 @@ mod tests {
         kg_args.name = Some("doc".into());
         let stored = run_store(tmp.path(), kg_args).unwrap();
 
-        let blob_path = kinora::paths::store_blob_path(
+        let blob_path = kinora::paths::find_blob_path(
             &kinora_root(tmp.path()),
             &kinora::hash::Hash::from_str(&stored.event.hash).unwrap(),
-        );
+        )
+        .unwrap();
         let written = fs::read_to_string(blob_path).unwrap();
         assert!(written.contains(&first.event.id));
     }
