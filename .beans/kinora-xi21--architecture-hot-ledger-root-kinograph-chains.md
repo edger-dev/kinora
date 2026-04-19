@@ -5,7 +5,7 @@ status: draft
 type: epic
 priority: normal
 created_at: 2026-04-19T05:38:37Z
-updated_at: 2026-04-19T05:38:37Z
+updated_at: 2026-04-19T06:49:09Z
 ---
 
 Post-bootstrap architecture for kinora's history and compaction model. Supersedes the current ledger-per-kino layout (`.kinora/ledger/<lineage>.jsonl`) and retires earlier sketches of a separate "cold ledger" format.
@@ -83,13 +83,44 @@ Each phase is an independent follow-on bean.
 - **In scope:** data model, file layout, compaction model, GC/prune semantics, metadata ownership.
 - **Deferred:** branch enumeration & multi-branch render (kinora-ohwb continues), cross-repo federation, remote fetch, UI rendering.
 
-## Open questions (not blocking; refine during phase beans)
+## Resolved phase-2 decisions (2026-04-19)
 
-- Canonical styx schema for root kinograph entries
-- Git hook shape: pre-commit, post-commit, post-merge, or wrapper command?
-- Fast-forward merges and rebases: how do we ensure compaction is idempotent?
-- Genesis root: any special form, or identical except for no parents?
-- Merkle grouping rule for sub-kinographs: hash-prefix (automatic) or user-declared topic (curated)?
+### Root entry schema (flat form)
+
+```
+entry {
+  id <kino-id>
+  version <content-hash>       # pins a specific version → root has true snapshot semantics
+  kind <kind>                  # so render doesn't need a second ledger lookup
+  metadata { name, title, … }  # authoritative; this is the metadata home (decision #7)
+  note? <text>                 # composition hint
+  pin? true                    # exempt from the root's GC policy
+}
+```
+
+Phase 4 introduces a second entry shape for Merkle grouping: `entry { subkinograph <kg-id>, version <hash> }`. Only the flat form ships in phase 2.
+
+### Invocation model
+
+Manual `kinora compact` command. **No git hooks** for phase 2 — explicit invocation keeps bootstrap simple and avoids pre-commit/post-commit/rebase edge cases. Doubled commits (source-intent commit + compaction commit) are fine. Hook wiring deferred to a later phase only if manual invocation proves insufficient in practice.
+
+### Genesis root
+
+Identical shape to any other root version, just `parents[]` empty. No sentinel kind, no marker metadata. Created **lazily** on the first `kinora compact` that has content to promote — no eager empty-kinograph blob at `kinora init`. The `inbox` root follows the same rule once multi-root lands (phase 3).
+
+### Compaction idempotence
+
+Compaction is a pure function of `(hot_events, prior_root_version, root_config)`. Determinism rules:
+
+1. Sort root entries by `id` before serializing.
+2. Canonical styx serialization (sorted keys, stable whitespace) — already in place for events.
+3. When a git merge has unioned hot events from two sides, the new root version's `parents[]` lists both prior root versions in **canonical hash order**.
+
+Motivation under the no-hooks model: two developers running `kinora compact` independently on the same hot-event set must produce byte-identical root blobs, else branches diverge pointlessly on merge.
+
+## Deferred open questions
+
+- Merkle grouping rule for sub-kinographs: hash-prefix (automatic) or user-declared topic (curated)? **Phase 4 concern.**
 
 ## Supersedes
 
