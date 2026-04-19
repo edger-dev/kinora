@@ -12,6 +12,7 @@ pub mod kinograph;
 pub mod ledger;
 pub mod namespace;
 pub mod paths;
+pub mod reformat;
 pub mod render;
 pub mod resolve;
 pub mod root;
