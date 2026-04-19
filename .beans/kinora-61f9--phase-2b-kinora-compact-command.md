@@ -1,11 +1,11 @@
 ---
 # kinora-61f9
 title: 'Phase 2B: `kinora compact` command'
-status: in-progress
+status: completed
 type: feature
 priority: normal
 created_at: 2026-04-19T06:50:57Z
-updated_at: 2026-04-19T07:11:40Z
+updated_at: 2026-04-19T07:15:13Z
 parent: kinora-xi21
 blocked_by:
     - kinora-h4xs
@@ -84,3 +84,29 @@ Phase 2 ships single-flat-root. Default `--root main` when not specified. Phase 
 - GC/prune (phase 3)
 - Git hooks (explicitly deferred)
 - Sub-kinograph entries (phase 4)
+
+
+## Summary of Changes
+
+Landed in 3 commits:
+
+- `8e1be7e compact: library fn to promote hot events into root kinograph` — introduces `kinora::compact` module with `compact()`, `build_root()`, `read_root_pointer()`, `CompactParams`, `CompactResult`, `CompactError`. Adds `paths::roots_dir` / `paths::root_pointer_path` helpers.
+- `c9d4e19 cli: kinora compact command` — wires `kinora compact [--root NAME] [--author NAME] [--provenance STR]` with git-resolved author and RFC3339 `jiff::Timestamp::now()` timestamp.
+- `50a5459 compact: review fixes — distinct NoHead + validate root_name` — splits the zero-heads cycle case into a dedicated `NoHead` error (previously mis-shaped as `MultipleHeads { heads: [] }`) and adds a path-traversal guard on root name.
+
+### Key design choices
+
+- **Root-kind events are excluded from the new root's entries** — a root kinograph is the state of user content, not its own history. Prior root versions chain through the event `parents` link, not via self-reference.
+- **Pointer file format**: exactly the 64-hex version hash, no trailing newline. `read_root_pointer` is forgiving of trailing `
+`/`\r
+` in case a human edited the file.
+- **Determinism**: `build_root` groups events via `BTreeMap` (sorted by id), picks the single head per identity deterministically, and `RootKinograph::to_styx()` sorts entries by id. Two devs running compact over the same hot-event set produce byte-identical root blobs regardless of iteration order — verified by `two_independent_compactions_produce_byte_identical_root_blobs`.
+- **No-op detection**: two paths — (a) no prior pointer + zero events → skip; (b) prior pointer exists and fresh canonical bytes match the stored prior bytes → skip. In both cases `new_version = None` is returned and the pointer file is untouched.
+- **Forks rejected**: multiple heads for one identity error out as `MultipleHeads`. Phase 3's assign events will be the supported way to nominate a winner.
+- **Multi-parent root linking** is a future path (post-merge reconciliation where two prior root versions need joining). Current implementation always emits `parents = vec![prior]` for the single-parent happy path — per the bean's design note that phase 2B primarily exercises genesis + single-parent.
+
+### Tests (14 new, all passing)
+
+- Genesis, subsequent, idempotence, cross-dev determinism, entry sort, pointer-file format, CLI defaults (`main`/`compact`/git author), 3-kino + v2-bump scenario, fork rejection, cycle (`NoHead`), invalid root name validation, pointer file trailing-newline tolerance.
+
+Zero compiler warnings. All 228 kinora + 45 CLI tests pass.
