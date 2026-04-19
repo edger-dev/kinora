@@ -2830,4 +2830,220 @@ roots {
         assert_eq!(c_res.retained_by_cross_root.get("ra").copied(), Some(1));
         assert_eq!(c_res.retained_by_cross_root.get("rb").copied(), Some(1));
     }
+
+    // ------------------------------------------------------------------
+    // q6bo: per-commit archive kinos for the `commits` root
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn commit_root_produces_archive_kino_and_assign_to_commits() {
+        // When a non-commits root actually promotes work, `commit_root`
+        // stores a `commit-archive` kino and assigns it to `commits` so
+        // the archive enters the commits kinograph on the next pass.
+        let (_t, root) = setup();
+        write_config(
+            &root,
+            r#"repo-url "https://example.com/x.git"
+roots {
+  main { policy "never" }
+}
+"#,
+        );
+
+        let k = store_md(&root, b"doc", "doc", "2026-04-19T10:00:00Z");
+        write_assign_for(&root, &k.id, "main", vec![], "2026-04-19T10:00:01Z");
+
+        let res =
+            commit_root(&root, "main", params("yj", "2026-04-19T10:00:02Z")).unwrap();
+        assert!(res.new_version.is_some(), "main should have produced a version");
+
+        let events = Ledger::new(&root).read_all_events().unwrap();
+        let archive_store = events
+            .iter()
+            .find(|e| e.is_store_event() && e.kind == ARCHIVE_CONTENT_KIND)
+            .expect("archive store event should have been recorded");
+        assert_eq!(
+            archive_store.metadata.get("name").map(String::as_str),
+            Some("main-commit-archive"),
+            "archive name should be <root>-commit-archive",
+        );
+
+        let archive_assign = events
+            .iter()
+            .find(|e| {
+                if e.event_kind != EVENT_KIND_ASSIGN {
+                    return false;
+                }
+                let Ok(a) = AssignEvent::from_event(e) else {
+                    return false;
+                };
+                a.kino_id == archive_store.id && a.target_root == COMMITS_ROOT
+            })
+            .expect("assign from archive kino to `commits` should exist");
+        let _ = archive_assign;
+
+        // Archive is a real blob in the content store — readable by hash.
+        let hash = Hash::from_str(&archive_store.hash).unwrap();
+        let bytes = ContentStore::new(&root).read(&hash).unwrap();
+        let (schema, parsed) =
+            crate::commit_archive::parse_archive(&bytes).unwrap();
+        assert_eq!(schema, crate::commit_archive::ARCHIVE_SCHEMA_V1);
+        // The archive body captured main's owned events: the store of
+        // `doc` and the assign routing it to `main`.
+        assert!(
+            parsed.iter().any(|e| e.is_store_event() && e.id == k.id),
+            "archive should contain the owned store event",
+        );
+        assert!(
+            parsed.iter().any(|e| {
+                if e.event_kind != EVENT_KIND_ASSIGN {
+                    return false;
+                }
+                let Ok(a) = AssignEvent::from_event(e) else {
+                    return false;
+                };
+                a.kino_id == k.id && a.target_root == "main"
+            }),
+            "archive should contain the owned assign event",
+        );
+    }
+
+    #[test]
+    fn commits_root_does_not_archive_itself() {
+        // The commits root never produces its own archive — it would just
+        // duplicate entries already present in its own kinograph.
+        let (_t, root) = setup();
+        write_config(
+            &root,
+            r#"repo-url "https://example.com/x.git"
+roots {
+  main { policy "never" }
+}
+"#,
+        );
+        let k = store_md(&root, b"m", "m", "2026-04-19T10:00:00Z");
+        write_assign_for(&root, &k.id, "main", vec![], "2026-04-19T10:00:01Z");
+
+        commit_all(&root, params("yj", "2026-04-19T10:00:02Z")).unwrap();
+
+        // Exactly one archive kino should exist (main's). A second archive
+        // would mean commits tried to archive its own version bump.
+        let events = Ledger::new(&root).read_all_events().unwrap();
+        let archive_stores: Vec<_> = events
+            .iter()
+            .filter(|e| e.is_store_event() && e.kind == ARCHIVE_CONTENT_KIND)
+            .collect();
+        assert_eq!(
+            archive_stores.len(),
+            1,
+            "exactly one archive (main's) should exist; got: {archive_stores:?}",
+        );
+        assert_eq!(
+            archive_stores[0]
+                .metadata
+                .get("name")
+                .map(String::as_str),
+            Some("main-commit-archive"),
+        );
+    }
+
+    #[test]
+    fn commits_kinograph_contains_archive_after_commit_all() {
+        // End-to-end: one batch of `commit_all` promotes a kino into main,
+        // writes main's archive, and the commits root commits last —
+        // picking the archive up as its own entry.
+        let (_t, root) = setup();
+        write_config(
+            &root,
+            r#"repo-url "https://example.com/x.git"
+roots {
+  main { policy "never" }
+}
+"#,
+        );
+        let k = store_md(&root, b"hello", "hello", "2026-04-19T10:00:00Z");
+        write_assign_for(&root, &k.id, "main", vec![], "2026-04-19T10:00:01Z");
+
+        let entries = commit_all(&root, params("yj", "2026-04-19T10:00:02Z")).unwrap();
+        let commits_entry = entries
+            .iter()
+            .find(|(n, _)| n == COMMITS_ROOT)
+            .expect("commits entry present");
+        let commits_version = commits_entry
+            .1
+            .as_ref()
+            .unwrap()
+            .new_version
+            .as_ref()
+            .expect("commits should have a version — it consumed an archive-assign");
+
+        let events = Ledger::new(&root).read_all_events().unwrap();
+        let archive_id = events
+            .iter()
+            .find(|e| e.is_store_event() && e.kind == ARCHIVE_CONTENT_KIND)
+            .map(|e| e.id.clone())
+            .expect("archive kino should be in the ledger");
+
+        let ids = root_ids(&root, commits_version);
+        assert_eq!(
+            ids,
+            vec![archive_id],
+            "commits kinograph should list only the archive kino",
+        );
+    }
+
+    #[test]
+    fn archive_creation_is_idempotent_across_repeated_commits() {
+        // Running `commit_all` twice against the same effective state —
+        // same owned events, same archive content — produces one archive
+        // kino and one live assign into commits. Only timestamps differ
+        // between runs; the archive hash is identical.
+        let (_t, root) = setup();
+        write_config(
+            &root,
+            r#"repo-url "https://example.com/x.git"
+roots {
+  main { policy "never" }
+}
+"#,
+        );
+        let k = store_md(&root, b"doc", "doc", "2026-04-19T10:00:00Z");
+        write_assign_for(&root, &k.id, "main", vec![], "2026-04-19T10:00:01Z");
+
+        commit_all(&root, params("yj", "2026-04-19T10:00:02Z")).unwrap();
+        // Second commit — no new user events happened, only time passed.
+        commit_all(&root, params("yj", "2026-04-19T11:00:00Z")).unwrap();
+
+        let events = Ledger::new(&root).read_all_events().unwrap();
+        let archive_stores: Vec<_> = events
+            .iter()
+            .filter(|e| e.is_store_event() && e.kind == ARCHIVE_CONTENT_KIND)
+            .collect();
+        assert_eq!(
+            archive_stores.len(),
+            1,
+            "archive is content-addressed; re-running shouldn't duplicate it",
+        );
+
+        // Exactly one live assign to commits for that archive id. (More
+        // than one would risk AmbiguousAssign on a future commit.)
+        let archive_id = &archive_stores[0].id;
+        let assigns_to_commits: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                if e.event_kind != EVENT_KIND_ASSIGN {
+                    return false;
+                }
+                let Ok(a) = AssignEvent::from_event(e) else {
+                    return false;
+                };
+                a.kino_id == *archive_id && a.target_root == COMMITS_ROOT
+            })
+            .collect();
+        assert_eq!(
+            assigns_to_commits.len(),
+            1,
+            "archive-assign should not duplicate across runs; got: {assigns_to_commits:?}",
+        );
+    }
 }
