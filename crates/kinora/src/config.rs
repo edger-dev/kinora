@@ -35,10 +35,22 @@ impl RootPolicy {
     /// - `<digits><letters>` (e.g. `"30d"`, `"12h"`) → `MaxAge(raw)`
     /// - anything else → `None`
     pub fn from_policy_str(raw: &str) -> Option<Self> {
-        // STUB (hxmw-c48l commit-1): always returns None so tests observe the
-        // stubbed behaviour via assertions.
-        let _ = raw;
-        None
+        if raw == "never" {
+            return Some(RootPolicy::Never);
+        }
+        if let Some(rest) = raw.strip_prefix("keep-last-") {
+            let n: usize = rest.parse().ok()?;
+            return Some(RootPolicy::KeepLastN(n));
+        }
+        let digit_end = raw.bytes().take_while(|b| b.is_ascii_digit()).count();
+        if digit_end == 0 || digit_end == raw.len() {
+            return None;
+        }
+        let tail = &raw[digit_end..];
+        if !tail.bytes().all(|b| b.is_ascii_alphabetic()) {
+            return None;
+        }
+        Some(RootPolicy::MaxAge(raw.to_owned()))
     }
 
     /// Inverse of `from_policy_str` — produces the canonical wire form.
@@ -98,19 +110,38 @@ impl Config {
     pub fn from_styx(input: &str) -> Result<Self, ConfigError> {
         let raw: RawConfig = facet_styx::from_str(input)
             .map_err(|e| ConfigError::Parse(e.to_string()))?;
-        // STUB (hxmw-c48l commit-1): policies never parse, inbox is never
-        // auto-provisioned. Commit 2 replaces with real logic.
-        let _ = raw.roots;
-        let roots: BTreeMap<String, RootPolicy> = BTreeMap::new();
+        let mut roots: BTreeMap<String, RootPolicy> = BTreeMap::new();
+        if let Some(raw_roots) = raw.roots {
+            for (name, block) in raw_roots {
+                let policy = RootPolicy::from_policy_str(&block.policy).ok_or_else(|| {
+                    ConfigError::InvalidPolicy {
+                        root: name.clone(),
+                        raw: block.policy.clone(),
+                    }
+                })?;
+                roots.insert(name, policy);
+            }
+        }
+        roots
+            .entry("inbox".to_owned())
+            .or_insert_with(|| RootPolicy::MaxAge(DEFAULT_INBOX_POLICY.to_owned()));
         Ok(Self { repo_url: raw.repo_url, roots })
     }
 
     pub fn to_styx(&self) -> Result<String, ConfigError> {
-        // STUB (hxmw-c48l commit-1): serialize only repo_url. Commit 2
-        // adds the roots block emission.
+        let raw_roots: BTreeMap<String, RawRootBlock> = self
+            .roots
+            .iter()
+            .map(|(name, policy)| {
+                (
+                    name.clone(),
+                    RawRootBlock { policy: policy.to_policy_str() },
+                )
+            })
+            .collect();
         let raw = RawConfig {
             repo_url: self.repo_url.clone(),
-            roots: None,
+            roots: Some(raw_roots),
         };
         facet_styx::to_string(&raw).map_err(|e| ConfigError::Serialize(e.to_string()))
     }
