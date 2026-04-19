@@ -5,7 +5,7 @@ status: in-progress
 type: feature
 priority: normal
 created_at: 2026-04-19T14:39:21Z
-updated_at: 2026-04-19T18:21:03Z
+updated_at: 2026-04-19T18:21:32Z
 blocked_by:
     - kinora-2t6l
 ---
@@ -130,7 +130,7 @@ Three phases, each TDD cycle (tests → impl → review fix). Complete 1 phase =
 - [x] Phase A: config auto-provision tests
 - [x] Phase A: config auto-provision impl
 - [x] Phase B: commit_archive module tests
-- [ ] Phase B: commit_archive module impl
+- [x] Phase B: commit_archive module impl
 - [ ] Phase C: integration tests
 - [ ] Phase C: commit pipeline archive + cleanup + special-case
 - [ ] Phase C: render exclusion
