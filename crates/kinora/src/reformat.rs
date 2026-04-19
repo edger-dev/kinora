@@ -17,20 +17,22 @@
 //! 4. Idempotent: re-running reformat on an already-styxl repo stages no
 //!    events and updates no pointers.
 
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::str::FromStr;
 
-use crate::commit::CommitError;
-use crate::config::ConfigError;
-use crate::event::EventError;
+use crate::commit::{read_root_pointer, CommitError};
+use crate::config::{Config, ConfigError};
+use crate::event::{Event, EventError};
 use crate::hash::{Hash, HashParseError};
-use crate::kino::StoreKinoError;
-use crate::kinograph::KinographError;
-use crate::ledger::LedgerError;
-use crate::paths::{root_pointer_path, roots_dir};
-use crate::root::RootError;
-use crate::store::StoreError;
+use crate::kino::{store_kino, StoreKinoError, StoreKinoParams};
+use crate::kinograph::{is_styxl, Kinograph, KinographError};
+use crate::ledger::{Ledger, LedgerError};
+use crate::paths::{config_path, root_pointer_path, roots_dir};
+use crate::root::{RootError, RootKinograph};
+use crate::store::{ContentStore, StoreError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReformatError {
@@ -101,20 +103,192 @@ pub struct ReformatReport {
 /// run a subsequent `kinora commit` to surface the staged kinograph
 /// versions as heads for render.
 pub fn reformat_repo(
-    _kinora_root: &Path,
-    _params: ReformatParams,
+    kinora_root: &Path,
+    params: ReformatParams,
 ) -> Result<ReformatReport, ReformatError> {
-    // Stub — real body lands in the follow-up commit so the tests in this
-    // commit fail at runtime (not compile time), validating the spec
-    // before the implementation exists.
-    Ok(ReformatReport::default())
+    let cfg_text = fs::read_to_string(config_path(kinora_root))?;
+    let config = Config::from_styx(&cfg_text)?;
+
+    let store = ContentStore::new(kinora_root);
+    let ledger = Ledger::new(kinora_root);
+
+    let mut report = ReformatReport::default();
+
+    // Step 1: reformat root kinographs in name order. Each root's pointer
+    // is rewritten to the new blob + a store event recorded, mirroring
+    // what `commit_root` does on a regular version bump.
+    for root_name in config.roots.keys() {
+        let Some(prior_hash) = read_root_pointer(kinora_root, root_name)? else {
+            continue;
+        };
+        let content = store.read(&prior_hash)?;
+        let text = std::str::from_utf8(&content).unwrap_or("");
+        if is_styxl(text) {
+            report.skipped_roots_already_formatted += 1;
+            continue;
+        }
+        let root_kg = RootKinograph::parse(&content)?;
+        let new_bytes = root_kg.to_styxl()?.into_bytes();
+        if new_bytes == content {
+            report.skipped_roots_already_formatted += 1;
+            continue;
+        }
+
+        // Find the prior store event so we can carry its identity forward.
+        let events = ledger.read_all_events()?;
+        let prior_event = events
+            .iter()
+            .find(|e| e.hash == prior_hash.as_hex() && e.is_store_event())
+            .ok_or_else(|| ReformatError::PriorRootEventMissing {
+                name: root_name.clone(),
+                version: prior_hash.as_hex().to_owned(),
+            })?
+            .clone();
+
+        let stored = store_kino(
+            kinora_root,
+            StoreKinoParams {
+                kind: "root".into(),
+                content: new_bytes,
+                author: params.author.clone(),
+                provenance: params.provenance.clone(),
+                ts: params.ts.clone(),
+                metadata: BTreeMap::new(),
+                id: Some(prior_event.id.clone()),
+                parents: vec![prior_hash.as_hex().to_owned()],
+            },
+        )?;
+        let new_hash = Hash::from_str(&stored.event.hash).map_err(|err| {
+            ReformatError::InvalidHash {
+                value: stored.event.hash.clone(),
+                err,
+            }
+        })?;
+        write_root_pointer(kinora_root, root_name, &new_hash)?;
+
+        report.reformatted_roots.push(ReformattedRoot {
+            root_name: root_name.clone(),
+            prior_version: prior_hash.as_hex().to_owned(),
+            new_version: new_hash.as_hex().to_owned(),
+        });
+    }
+
+    // Step 2: walk every root pointer's current root kinograph, collect
+    // kinograph-kind entry ids, and recurse into their heads' composition
+    // entries. Reformat each kinograph kino we hit whose content is still
+    // legacy-wrapped.
+    let events = ledger.read_all_events()?;
+    let events_by_id = group_store_events_by_id(&events);
+
+    let mut to_visit: Vec<String> = Vec::new();
+    for root_name in config.roots.keys() {
+        let Some(hash) = read_root_pointer(kinora_root, root_name)? else {
+            continue;
+        };
+        let content = store.read(&hash)?;
+        let root_kg = RootKinograph::parse(&content)?;
+        for entry in &root_kg.entries {
+            if entry.kind == "kinograph" {
+                to_visit.push(entry.id.clone());
+            }
+        }
+    }
+
+    let mut visited: HashSet<String> = HashSet::new();
+    while let Some(id) = to_visit.pop() {
+        if !visited.insert(id.clone()) {
+            continue;
+        }
+        let Some(group) = events_by_id.get(&id) else {
+            continue;
+        };
+        let head = pick_head(&id, group)?;
+        if head.kind != "kinograph" {
+            continue;
+        }
+
+        let head_hash = Hash::from_str(&head.hash).map_err(|err| {
+            ReformatError::InvalidHash {
+                value: head.hash.clone(),
+                err,
+            }
+        })?;
+        let content = store.read(&head_hash)?;
+        let text = std::str::from_utf8(&content).unwrap_or("");
+        if is_styxl(text) {
+            report.skipped_kinographs_already_formatted += 1;
+            continue;
+        }
+        let kg = Kinograph::parse(&content)?;
+        let new_bytes = kg.to_styxl()?.into_bytes();
+        if new_bytes == content {
+            report.skipped_kinographs_already_formatted += 1;
+            continue;
+        }
+
+        let stored = store_kino(
+            kinora_root,
+            StoreKinoParams {
+                kind: "kinograph".into(),
+                content: new_bytes,
+                author: params.author.clone(),
+                provenance: params.provenance.clone(),
+                ts: params.ts.clone(),
+                metadata: BTreeMap::new(),
+                id: Some(head.id.clone()),
+                parents: vec![head.hash.clone()],
+            },
+        )?;
+        report.reformatted_kinographs.push(ReformattedKinograph {
+            id: head.id.clone(),
+            prior_version: head.hash.clone(),
+            new_version: stored.event.hash.clone(),
+        });
+
+        // Recurse into composition entries so nested kinographs also get
+        // reformatted in the same pass.
+        for entry in &kg.entries {
+            if !visited.contains(&entry.id) {
+                to_visit.push(entry.id.clone());
+            }
+        }
+    }
+
+    Ok(report)
 }
 
-/// Atomically write `.kinora/roots/<name>` with the given 64-hex hash.
-/// Mirrors `commit::write_root_pointer` but is kept private to this
-/// module so the reformat path can update pointers without taking a
-/// `pub(crate)` dep on commit internals.
-#[cfg_attr(not(test), allow(dead_code))]
+fn group_store_events_by_id(events: &[Event]) -> BTreeMap<String, Vec<Event>> {
+    let mut out: BTreeMap<String, Vec<Event>> = BTreeMap::new();
+    for e in events {
+        if e.is_store_event() {
+            out.entry(e.id.clone()).or_default().push(e.clone());
+        }
+    }
+    out
+}
+
+fn pick_head<'a>(id: &str, events: &'a [Event]) -> Result<&'a Event, ReformatError> {
+    let referenced: HashSet<&str> = events
+        .iter()
+        .flat_map(|e| e.parents.iter().map(String::as_str))
+        .collect();
+    let heads: Vec<&Event> = events
+        .iter()
+        .filter(|e| !referenced.contains(e.hash.as_str()))
+        .collect();
+    match heads.as_slice() {
+        [only] => Ok(*only),
+        [] => Err(ReformatError::MultipleHeads {
+            id: id.to_owned(),
+            heads: Vec::new(),
+        }),
+        many => Err(ReformatError::MultipleHeads {
+            id: id.to_owned(),
+            heads: many.iter().map(|e| e.hash.clone()).collect(),
+        }),
+    }
+}
+
 fn write_root_pointer(kinora_root: &Path, root_name: &str, hash: &Hash) -> io::Result<()> {
     let dir = roots_dir(kinora_root);
     fs::create_dir_all(&dir)?;
@@ -129,17 +303,10 @@ fn write_root_pointer(kinora_root: &Path, root_name: &str, hash: &Hash) -> io::R
 mod tests {
     use super::*;
     use crate::commit::{commit_all, commit_root, CommitParams};
-    use crate::event::Event;
     use crate::init::init;
-    use crate::kino::{store_kino, StoreKinoParams};
-    use crate::kinograph::{is_styxl, Entry as KinographEntry, Kinograph};
-    use crate::ledger::Ledger;
+    use crate::kinograph::Entry as KinographEntry;
     use crate::paths::kinora_root;
-    use crate::root::RootKinograph;
-    use crate::store::ContentStore;
-    use std::collections::BTreeMap;
     use std::path::PathBuf;
-    use std::str::FromStr;
     use tempfile::TempDir;
 
     fn setup() -> (TempDir, PathBuf) {
@@ -289,12 +456,8 @@ mod tests {
     fn reformat_stages_new_version_for_legacy_kinograph_kino() {
         let (_t, root) = setup();
         let md = store_md(&root, b"hello", "hello", "2026-04-19T10:00:00Z");
-        let kg_event = store_legacy_kinograph(
-            &root,
-            std::slice::from_ref(&md.id),
-            "list",
-            "2026-04-19T10:00:01Z",
-        );
+        let kg_event =
+            store_legacy_kinograph(&root, std::slice::from_ref(&md.id), "list", "2026-04-19T10:00:01Z");
 
         // Commit so the kinograph kino is reachable from the inbox root.
         commit_all(&root, commit_params("2026-04-19T10:00:02Z")).unwrap();
@@ -333,12 +496,7 @@ mod tests {
     fn reformat_is_idempotent_on_already_styxl_kinograph_kino() {
         let (_t, root) = setup();
         let md = store_md(&root, b"hello", "hello", "2026-04-19T10:00:00Z");
-        store_styxl_kinograph(
-            &root,
-            std::slice::from_ref(&md.id),
-            "list",
-            "2026-04-19T10:00:01Z",
-        );
+        store_styxl_kinograph(&root, std::slice::from_ref(&md.id), "list", "2026-04-19T10:00:01Z");
         commit_all(&root, commit_params("2026-04-19T10:00:02Z")).unwrap();
 
         let report =
@@ -381,6 +539,7 @@ mod tests {
             events_before.len(),
             "no new events for markdown/text kinos"
         );
+        // Text kino's content is unchanged — no new-version event for its id.
         let versions_for_text: Vec<&Event> = events_after
             .iter()
             .filter(|e| e.id == text_event.id && e.is_store_event())
@@ -391,6 +550,8 @@ mod tests {
     #[test]
     fn reformat_rewrites_legacy_root_kinograph_and_updates_pointer() {
         let (_t, root) = setup();
+        // Seed a legacy root pointer by hand (current commit code writes
+        // styxl, so we can't produce a legacy root via commit_root).
         let md = store_md(&root, b"body", "body", "2026-04-19T10:00:00Z");
         let md_hash = Hash::from_str(&md.hash).unwrap();
         let entries = vec![crate::root::RootEntry::new(
@@ -418,13 +579,16 @@ mod tests {
         assert_eq!(reform.prior_version, prior_root.hash);
         assert_ne!(reform.new_version, prior_root.hash);
 
+        // Pointer now points at the new blob.
         let pointer_body = fs::read_to_string(root_pointer_path(&root, "inbox")).unwrap();
         assert_eq!(pointer_body.trim(), reform.new_version);
 
+        // New blob is styxl.
         let new_hash = Hash::from_str(&reform.new_version).unwrap();
         let new_bytes = ContentStore::new(&root).read(&new_hash).unwrap();
         assert!(is_styxl(std::str::from_utf8(&new_bytes).unwrap()));
 
+        // A new root-kind store event is in the ledger, parented to the prior root.
         let events = Ledger::new(&root).read_all_events().unwrap();
         let new_event = events
             .iter()
@@ -439,6 +603,7 @@ mod tests {
     fn reformat_is_idempotent_on_already_styxl_roots() {
         let (_t, root) = setup();
         store_md(&root, b"a", "a", "2026-04-19T10:00:00Z");
+        // commit_all writes the root as styxl already.
         commit_all(&root, commit_params("2026-04-19T10:00:01Z")).unwrap();
 
         let pointer_before =
@@ -464,12 +629,15 @@ mod tests {
     fn reformat_recurses_into_nested_composition_entries() {
         let (_t, root) = setup();
         let leaf = store_md(&root, b"leaf", "leaf", "2026-04-19T10:00:00Z");
+        // Inner legacy kinograph pointing at `leaf`.
         let inner = store_legacy_kinograph(
             &root,
             std::slice::from_ref(&leaf.id),
             "inner",
             "2026-04-19T10:00:01Z",
         );
+        // Outer legacy kinograph composing `inner` — reformat must walk
+        // into `inner` via the outer's composition entries.
         let outer = store_legacy_kinograph(
             &root,
             std::slice::from_ref(&inner.id),
@@ -498,16 +666,15 @@ mod tests {
     fn reformat_then_commit_makes_new_version_the_head() {
         let (_t, root) = setup();
         let md = store_md(&root, b"hello", "hello", "2026-04-19T10:00:00Z");
-        let kg_event = store_legacy_kinograph(
-            &root,
-            std::slice::from_ref(&md.id),
-            "list",
-            "2026-04-19T10:00:01Z",
-        );
+        let kg_event =
+            store_legacy_kinograph(&root, std::slice::from_ref(&md.id), "list", "2026-04-19T10:00:01Z");
         commit_all(&root, commit_params("2026-04-19T10:00:02Z")).unwrap();
 
         let _report =
             reformat_repo(&root, reformat_params("2026-04-19T10:00:03Z")).unwrap();
+        // A subsequent commit should promote the reformatted version and
+        // leave the root pointing at a new root-blob whose entry for the
+        // kinograph lists the new version hash.
         let commit = commit_root(&root, "inbox", commit_params("2026-04-19T10:00:04Z"))
             .unwrap();
         let new_root_hash = commit.new_version.expect("inbox should advance");
