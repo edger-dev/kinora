@@ -1,0 +1,339 @@
+use std::io;
+use std::path::Path;
+
+use crate::event::{Event, EventError, EVENT_KIND_ASSIGN};
+use crate::hash::Hash;
+use crate::ledger::LedgerError;
+
+/// `Event::kind` value for assign events. Namespaced under `kin::` so
+/// assign events pass the same kind-validation as store events while
+/// remaining distinct from any content kind. The true track discriminator
+/// is `event_kind = "assign"` (see `EVENT_KIND_ASSIGN`).
+pub const ASSIGN_KIND_TAG: &str = "kin::assign";
+
+/// Metadata key under which an assign event carries its target root name.
+/// Namespaced under `kin::` so it's unambiguously a protocol field and
+/// cannot collide with user or extension metadata.
+pub const META_TARGET_ROOT: &str = "kin::target_root";
+
+/// A kino→root assignment. Names a kino by id, a target root by name, and
+/// (optionally) a list of prior assign-event hashes this one supersedes.
+///
+/// Assign events carry no content blob — they only reshape the kino→root
+/// graph. Phase 3.5 (kinora-7mou) teaches compact to consume them; until
+/// then they live in the hot ledger and are transparently ignored by
+/// content-store consumers (resolver, render, compact today) via
+/// `Event::is_store_event()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssignEvent {
+    pub kino_id: String,
+    pub target_root: String,
+    pub supersedes: Vec<String>,
+    pub author: String,
+    pub ts: String,
+    pub provenance: String,
+}
+
+#[derive(Debug)]
+pub enum AssignError {
+    Io(io::Error),
+    Ledger(LedgerError),
+    Event(EventError),
+    NotAssignEvent { event_kind: String },
+    MissingTargetRoot,
+    EmptyTargetRoot,
+    EmptyKinoId,
+}
+
+impl std::fmt::Display for AssignError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AssignError::Io(e) => write!(f, "assign io error: {e}"),
+            AssignError::Ledger(e) => write!(f, "{e}"),
+            AssignError::Event(e) => write!(f, "{e}"),
+            AssignError::NotAssignEvent { event_kind } => {
+                write!(f, "expected event_kind=\"{EVENT_KIND_ASSIGN}\", got {event_kind:?}")
+            }
+            AssignError::MissingTargetRoot => {
+                write!(f, "assign event missing metadata key `{META_TARGET_ROOT}`")
+            }
+            AssignError::EmptyTargetRoot => write!(f, "assign target_root must be non-empty"),
+            AssignError::EmptyKinoId => write!(f, "assign kino_id must be non-empty"),
+        }
+    }
+}
+
+impl std::error::Error for AssignError {}
+
+impl From<io::Error> for AssignError {
+    fn from(e: io::Error) -> Self {
+        AssignError::Io(e)
+    }
+}
+
+impl From<LedgerError> for AssignError {
+    fn from(e: LedgerError) -> Self {
+        AssignError::Ledger(e)
+    }
+}
+
+impl From<EventError> for AssignError {
+    fn from(e: EventError) -> Self {
+        AssignError::Event(e)
+    }
+}
+
+impl AssignEvent {
+    /// Convert to the on-wire `Event` form. Assign events reuse the `Event`
+    /// struct so they flow through the same hot-ledger write/read path as
+    /// store events. Field mapping:
+    ///
+    /// | Event field    | AssignEvent source                    |
+    /// |----------------|---------------------------------------|
+    /// | `event_kind`   | `"assign"`                            |
+    /// | `kind`         | `"kin::assign"`                       |
+    /// | `id`           | `kino_id`                             |
+    /// | `hash`         | `kino_id` (placeholder — no blob)     |
+    /// | `parents`      | `supersedes`                          |
+    /// | `metadata`     | `{ "kin::target_root": target_root }` |
+    ///
+    /// `hash` is set to `kino_id` so the structural id==hash invariant a
+    /// future validator might check still holds; assign events carry no
+    /// content blob, so the field is effectively a placeholder.
+    pub fn to_event(&self) -> Event {
+        unimplemented!("AssignEvent::to_event — Phase A implementation pending")
+    }
+
+    /// Parse a wire `Event` back into an `AssignEvent`. Errors if
+    /// `event_kind != "assign"` or if the `kin::target_root` metadata key
+    /// is missing.
+    pub fn from_event(_e: &Event) -> Result<Self, AssignError> {
+        unimplemented!("AssignEvent::from_event — Phase A implementation pending")
+    }
+
+    /// BLAKE3 of this assign event's canonical JSON line (via `to_event()`).
+    /// Same content-addressing discipline as `Event::event_hash()`.
+    pub fn event_hash(&self) -> Result<Hash, AssignError> {
+        unimplemented!("AssignEvent::event_hash — Phase A implementation pending")
+    }
+}
+
+/// Write `a` to `.kinora/hot/<ab>/<event-hash>.jsonl`. Returns
+/// `(event_hash, was_new)` — `was_new` is true iff the target file did
+/// not exist before this call. Idempotent: re-writing the same logical
+/// assign event is a no-op.
+pub fn write_assign(
+    _kinora_root: &Path,
+    _a: &AssignEvent,
+) -> Result<(Hash, bool), AssignError> {
+    unimplemented!("write_assign — Phase A implementation pending")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use crate::ledger::Ledger;
+    use tempfile::TempDir;
+
+    fn sample() -> AssignEvent {
+        let kino = Hash::of_content(b"my-kino").as_hex().to_owned();
+        AssignEvent {
+            kino_id: kino,
+            target_root: "main".into(),
+            supersedes: vec![],
+            author: "yj".into(),
+            ts: "2026-04-19T10:00:00Z".into(),
+            provenance: "test".into(),
+        }
+    }
+
+    #[test]
+    fn to_event_sets_event_kind_to_assign() {
+        let e = sample().to_event();
+        assert_eq!(e.event_kind, EVENT_KIND_ASSIGN);
+        assert!(!e.is_store_event(), "assign event must not be a store event");
+    }
+
+    #[test]
+    fn to_event_uses_namespaced_assign_kind_tag() {
+        let e = sample().to_event();
+        assert_eq!(e.kind, ASSIGN_KIND_TAG);
+        assert_eq!(e.kind, "kin::assign");
+    }
+
+    #[test]
+    fn to_event_puts_target_root_in_metadata_under_namespaced_key() {
+        let a = sample();
+        let e = a.to_event();
+        assert_eq!(e.metadata.get(META_TARGET_ROOT), Some(&a.target_root));
+    }
+
+    #[test]
+    fn to_event_uses_kino_id_as_id_and_hash() {
+        let a = sample();
+        let e = a.to_event();
+        assert_eq!(e.id, a.kino_id);
+        assert_eq!(e.hash, a.kino_id);
+    }
+
+    #[test]
+    fn to_event_copies_supersedes_into_parents() {
+        let mut a = sample();
+        a.supersedes = vec![
+            Hash::of_content(b"prior-a").as_hex().into(),
+            Hash::of_content(b"prior-b").as_hex().into(),
+        ];
+        let e = a.to_event();
+        assert_eq!(e.parents, a.supersedes);
+    }
+
+    #[test]
+    fn from_event_inverts_to_event() {
+        let a = sample();
+        let e = a.to_event();
+        let back = AssignEvent::from_event(&e).unwrap();
+        assert_eq!(back, a);
+    }
+
+    #[test]
+    fn from_event_with_supersedes_roundtrips() {
+        let mut a = sample();
+        a.supersedes = vec![
+            Hash::of_content(b"prior-a").as_hex().into(),
+            Hash::of_content(b"prior-b").as_hex().into(),
+        ];
+        let e = a.to_event();
+        let back = AssignEvent::from_event(&e).unwrap();
+        assert_eq!(back, a);
+    }
+
+    #[test]
+    fn from_event_rejects_store_event() {
+        let e = Event::new_store(
+            "markdown".into(),
+            Hash::of_content(b"x").as_hex().into(),
+            Hash::of_content(b"x").as_hex().into(),
+            vec![],
+            "2026-04-19T10:00:00Z".into(),
+            "yj".into(),
+            "test".into(),
+            BTreeMap::new(),
+        );
+        let err = AssignEvent::from_event(&e).unwrap_err();
+        match err {
+            AssignError::NotAssignEvent { event_kind } => {
+                assert_eq!(event_kind, "store");
+            }
+            other => panic!("expected NotAssignEvent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_event_missing_target_root_metadata_errors() {
+        let mut e = sample().to_event();
+        e.metadata.clear();
+        let err = AssignEvent::from_event(&e).unwrap_err();
+        assert!(matches!(err, AssignError::MissingTargetRoot), "got {err:?}");
+    }
+
+    #[test]
+    fn event_hash_matches_underlying_event_hash() {
+        let a = sample();
+        let via_assign = a.event_hash().unwrap();
+        let via_event = a.to_event().event_hash().unwrap();
+        assert_eq!(via_assign, via_event);
+    }
+
+    #[test]
+    fn event_hash_changes_with_target_root() {
+        let a = sample();
+        let mut b = sample();
+        b.target_root = "drafts".into();
+        assert_ne!(a.event_hash().unwrap(), b.event_hash().unwrap());
+    }
+
+    #[test]
+    fn event_hash_changes_with_supersedes() {
+        let a = sample();
+        let mut b = sample();
+        b.supersedes = vec![Hash::of_content(b"prior").as_hex().into()];
+        assert_ne!(a.event_hash().unwrap(), b.event_hash().unwrap());
+    }
+
+    #[test]
+    fn write_assign_creates_hot_event_file() {
+        let tmp = TempDir::new().unwrap();
+        let kinora_root = tmp.path().join(".kinora");
+        let a = sample();
+        let (h, was_new) = write_assign(&kinora_root, &a).unwrap();
+        assert!(was_new);
+        let path = crate::paths::hot_event_path(&kinora_root, &h);
+        assert!(path.is_file(), "hot event file missing: {}", path.display());
+    }
+
+    #[test]
+    fn write_assign_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let kinora_root = tmp.path().join(".kinora");
+        let a = sample();
+        let (h1, new1) = write_assign(&kinora_root, &a).unwrap();
+        let (h2, new2) = write_assign(&kinora_root, &a).unwrap();
+        assert_eq!(h1, h2);
+        assert!(new1);
+        assert!(!new2, "second write of identical assign must not be new");
+    }
+
+    #[test]
+    fn write_assign_rejects_empty_kino_id() {
+        let tmp = TempDir::new().unwrap();
+        let kinora_root = tmp.path().join(".kinora");
+        let mut a = sample();
+        a.kino_id = String::new();
+        let err = write_assign(&kinora_root, &a).unwrap_err();
+        assert!(matches!(err, AssignError::EmptyKinoId), "got {err:?}");
+    }
+
+    #[test]
+    fn write_assign_rejects_empty_target_root() {
+        let tmp = TempDir::new().unwrap();
+        let kinora_root = tmp.path().join(".kinora");
+        let mut a = sample();
+        a.target_root = String::new();
+        let err = write_assign(&kinora_root, &a).unwrap_err();
+        assert!(matches!(err, AssignError::EmptyTargetRoot), "got {err:?}");
+    }
+
+    #[test]
+    fn write_assign_event_is_readable_via_ledger_read_all_events() {
+        let tmp = TempDir::new().unwrap();
+        let kinora_root = tmp.path().join(".kinora");
+        let a = sample();
+        write_assign(&kinora_root, &a).unwrap();
+
+        let events = Ledger::new(&kinora_root).read_all_events().unwrap();
+        assert_eq!(events.len(), 1);
+        let e = &events[0];
+        assert_eq!(e.event_kind, EVENT_KIND_ASSIGN);
+        assert!(!e.is_store_event());
+
+        let back = AssignEvent::from_event(e).unwrap();
+        assert_eq!(back, a);
+    }
+
+    #[test]
+    fn write_assign_different_kinos_produce_distinct_files() {
+        let tmp = TempDir::new().unwrap();
+        let kinora_root = tmp.path().join(".kinora");
+        let a = sample();
+        let mut b = sample();
+        b.kino_id = Hash::of_content(b"other-kino").as_hex().to_owned();
+
+        let (ha, _) = write_assign(&kinora_root, &a).unwrap();
+        let (hb, _) = write_assign(&kinora_root, &b).unwrap();
+        assert_ne!(ha, hb);
+
+        let events = Ledger::new(&kinora_root).read_all_events().unwrap();
+        assert_eq!(events.len(), 2);
+    }
+}

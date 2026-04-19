@@ -1,11 +1,11 @@
 ---
 # kinora-g08g
 title: 'Phase 3.3: assign event + kinora assign CLI + store --root atomic pair'
-status: todo
+status: in-progress
 type: task
 priority: normal
 created_at: 2026-04-19T10:17:36Z
-updated_at: 2026-04-19T10:17:40Z
+updated_at: 2026-04-19T11:08:46Z
 parent: kinora-hxmw
 blocked_by:
     - kinora-szkl

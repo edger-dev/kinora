@@ -1,3 +1,4 @@
+pub mod assign;
 pub mod author;
 pub mod cache_path;
 pub mod compact;

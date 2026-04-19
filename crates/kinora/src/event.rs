@@ -7,6 +7,11 @@ use crate::hash::Hash;
 /// Canonical value of `Event::event_kind` for content-store events.
 pub const EVENT_KIND_STORE: &str = "store";
 
+/// Canonical value of `Event::event_kind` for kino-to-root assign events
+/// (phase 3). Assign events carry no content — they name a kino id and
+/// the root it should belong to, optionally superseding prior assigns.
+pub const EVENT_KIND_ASSIGN: &str = "assign";
+
 /// Append-only ledger event.
 ///
 /// `event_kind` is the top-level discriminator introduced in phase 3 — it
