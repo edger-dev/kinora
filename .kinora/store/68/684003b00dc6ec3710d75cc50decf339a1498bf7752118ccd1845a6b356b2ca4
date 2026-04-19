@@ -1,0 +1,13 @@
+# Branches merge without ledger conflicts
+
+Kinora lives inside a git repo. Git branches are how humans explore independent lines of work. So the question is: *what happens when two branches independently store kinos, and then a merge happens?*
+
+The answer is structural, not behavioral:
+
+1. Every hot-ledger event lands in a file whose name is the hash of the event's canonical JSON. Two independent writes can only collide if they produced the same event — same author, same timestamp, same content, same everything. In practice they don't.
+2. Two branches adding disjoint events produce disjoint filenames. `git merge` sees them as non-overlapping file creations. There is nothing to conflict over.
+3. The ledger reader unions every hot event file in the tree. After a merge, both branches' events are visible as part of the same kinograph.
+
+What a merge produces, then, is a strictly larger event set than either branch had alone — and the resolver rebuilds identities from that larger set. Two branches that edited the same kino in incompatible ways become a fork (multiple heads on the same id); the system surfaces that explicitly rather than letting one branch silently win.
+
+The key invariant: **no ledger file is named by branch identity.** Filenames come only from content. This is what frees the merge from needing to know which branch anything came from.
