@@ -3,7 +3,7 @@ use std::process::ExitCode;
 
 use assign::{format_assign_summary, run_assign, AssignRunArgs};
 use cli::{Cli, Command};
-use compact::{run_compact, CompactRunArgs};
+use compact::{render_compact_entry, run_compact, CompactRunArgs};
 use render::{run_render, RenderRunArgs};
 use resolve::{
     head_lineages, render_all_heads, render_fork_report, run_resolve, ResolveOutcome,
@@ -114,30 +114,9 @@ fn main() -> ExitCode {
             let args = CompactRunArgs { author, provenance };
             match run_compact(&cwd, args) {
                 Ok(report) => {
-                    for (name, result) in &report.per_root {
-                        match result {
-                            Ok(r) => match &r.new_version {
-                                Some(h) => println!(
-                                    "root={} version={} (new version)",
-                                    name,
-                                    h.shorthash(),
-                                ),
-                                None => {
-                                    let version_str = r
-                                        .prior_version
-                                        .as_ref()
-                                        .map(|h| h.shorthash().to_owned())
-                                        .unwrap_or_else(|| "-".into());
-                                    println!(
-                                        "root={} version={} (no-op)",
-                                        name, version_str,
-                                    );
-                                }
-                            },
-                            Err(e) => {
-                                println!("root={} ERROR: {}", name, e);
-                            }
-                        }
+                    let mut stdout = std::io::stdout().lock();
+                    for entry in &report.per_root {
+                        let _ = render_compact_entry(&mut stdout, entry);
                     }
                     if report.any_error() {
                         ExitCode::FAILURE

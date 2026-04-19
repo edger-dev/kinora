@@ -1,12 +1,19 @@
+use std::io::{self, Write};
 use std::path::Path;
 
 use kinora::author::resolve_author_from_git;
-use kinora::compact::{compact_all, CompactAllEntry, CompactParams};
+use kinora::compact::{compact_all, CompactAllEntry, CompactError, CompactParams};
 use kinora::paths::kinora_root;
 
 use crate::common::{find_repo_root, CliError};
 
 pub const DEFAULT_PROVENANCE: &str = "compact";
+
+const SHORTHASH_LEN: usize = 8;
+
+fn short(hex: &str) -> &str {
+    &hex[..hex.len().min(SHORTHASH_LEN)]
+}
 
 pub struct CompactRunArgs {
     pub author: Option<String>,
@@ -44,6 +51,83 @@ pub fn run_compact(cwd: &Path, args: CompactRunArgs) -> Result<CompactRunReport,
     let params = CompactParams { author, provenance, ts };
     let per_root = compact_all(&kin_root, params)?;
     Ok(CompactRunReport { per_root })
+}
+
+/// Render a single per-root compact entry. Success cases render as a short
+/// `version=` line; failures fall through to `render_compact_error`.
+pub fn render_compact_entry<W: Write>(w: &mut W, entry: &CompactAllEntry) -> io::Result<()> {
+    let (name, result) = entry;
+    match result {
+        Ok(r) => match &r.new_version {
+            Some(h) => writeln!(w, "root={} version={} (new version)", name, h.shorthash()),
+            None => {
+                let version = r
+                    .prior_version
+                    .as_ref()
+                    .map(|h| h.shorthash().to_owned())
+                    .unwrap_or_else(|| "-".into());
+                writeln!(w, "root={name} version={version} (no-op)")
+            }
+        },
+        Err(e) => render_compact_error(w, name, e),
+    }
+}
+
+/// Render a `CompactError` under a named root. `AmbiguousAssign` and
+/// `UnknownRoot` get the D2 multi-line format so the user sees the
+/// candidates and a copy-pasteable resolution hint; other variants fall
+/// back to a single `root=X ERROR: <display>` line.
+pub fn render_compact_error<W: Write>(
+    w: &mut W,
+    root_name: &str,
+    err: &CompactError,
+) -> io::Result<()> {
+    match err {
+        CompactError::AmbiguousAssign { kino_id, candidates } => {
+            writeln!(
+                w,
+                "root={root_name}  ERROR: ambiguous assigns for kino {}…",
+                short(kino_id)
+            )?;
+            let target_width = candidates
+                .iter()
+                .map(|c| c.target_root.len())
+                .max()
+                .unwrap_or(0);
+            for c in candidates {
+                writeln!(
+                    w,
+                    "  - assign → {:<width$} (event {}…, {}, {})",
+                    c.target_root,
+                    short(&c.event_hash),
+                    c.author,
+                    c.ts,
+                    width = target_width,
+                )?;
+            }
+            let event_list = candidates
+                .iter()
+                .map(|c| format!("{}…", short(&c.event_hash)))
+                .collect::<Vec<_>>()
+                .join(",");
+            writeln!(
+                w,
+                "to resolve: kinora assign {}… <root> --resolves {event_list}",
+                short(kino_id),
+            )?;
+        }
+        CompactError::UnknownRoot { name, event_hash } => {
+            writeln!(
+                w,
+                "root={root_name}  ERROR: unknown root `{name}` referenced by assign event {}…",
+                short(event_hash),
+            )?;
+        }
+        other => {
+            writeln!(w, "root={root_name} ERROR: {other}")?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -197,5 +281,99 @@ mod tests {
             outcome.is_err(),
             "figue should reject --root on compact; got Ok(_)"
         );
+    }
+
+    // ---- D2 CLI rendering for AmbiguousAssign / UnknownRoot ----
+
+    fn render_err(root_name: &str, err: &CompactError) -> String {
+        let mut buf: Vec<u8> = Vec::new();
+        render_compact_error(&mut buf, root_name, err).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    #[test]
+    fn ambiguous_assign_renders_d2_block_with_resolution_hint() {
+        let kino_id = "a".repeat(64);
+        let candidates = vec![
+            kinora::compact::AssignCandidate {
+                event_hash: format!("{}{}", "abc1", "0".repeat(60)),
+                target_root: "rfcs".into(),
+                author: "yj".into(),
+                ts: "2026-04-19T10:00:00Z".into(),
+            },
+            kinora::compact::AssignCandidate {
+                event_hash: format!("{}{}", "def2", "0".repeat(60)),
+                target_root: "designs".into(),
+                author: "yj".into(),
+                ts: "2026-04-19T11:00:00Z".into(),
+            },
+        ];
+        let err = CompactError::AmbiguousAssign { kino_id: kino_id.clone(), candidates };
+        let out = render_err("rfcs", &err);
+        let expected = "\
+root=rfcs  ERROR: ambiguous assigns for kino aaaaaaaa…
+  - assign → rfcs    (event abc10000…, yj, 2026-04-19T10:00:00Z)
+  - assign → designs (event def20000…, yj, 2026-04-19T11:00:00Z)
+to resolve: kinora assign aaaaaaaa… <root> --resolves abc10000…,def20000…
+";
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn unknown_root_renders_single_line_with_offending_event() {
+        let err = CompactError::UnknownRoot {
+            name: "madeup".into(),
+            event_hash: format!("{}{}", "xyz12345", "0".repeat(56)),
+        };
+        let out = render_err("main", &err);
+        assert_eq!(
+            out,
+            "root=main  ERROR: unknown root `madeup` referenced by assign event xyz12345…\n"
+        );
+    }
+
+    #[test]
+    fn other_compact_errors_fall_back_to_single_line_format() {
+        let err = CompactError::NoHead { id: "z".repeat(64) };
+        let out = render_err("main", &err);
+        assert!(
+            out.starts_with("root=main ERROR: "),
+            "fallback format must be single-line; got: {out:?}"
+        );
+        assert!(out.ends_with('\n'));
+    }
+
+    #[test]
+    fn render_compact_entry_ok_with_new_version_uses_shorthash() {
+        use std::str::FromStr;
+        let hash = kinora::hash::Hash::from_str(&"f".repeat(64)).unwrap();
+        let entry: CompactAllEntry = (
+            "main".into(),
+            Ok(kinora::compact::CompactResult {
+                root_name: "main".into(),
+                new_version: Some(hash.clone()),
+                prior_version: None,
+            }),
+        );
+        let mut buf: Vec<u8> = Vec::new();
+        render_compact_entry(&mut buf, &entry).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(out, format!("root=main version={} (new version)\n", hash.shorthash()));
+    }
+
+    #[test]
+    fn render_compact_entry_ok_no_op_with_no_prior_renders_dash() {
+        let entry: CompactAllEntry = (
+            "inbox".into(),
+            Ok(kinora::compact::CompactResult {
+                root_name: "inbox".into(),
+                new_version: None,
+                prior_version: None,
+            }),
+        );
+        let mut buf: Vec<u8> = Vec::new();
+        render_compact_entry(&mut buf, &entry).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(out, "root=inbox version=- (no-op)\n");
     }
 }
