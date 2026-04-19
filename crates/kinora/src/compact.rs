@@ -16,13 +16,14 @@
 //! same hot event set produce byte-identical root blobs.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use crate::assign::AssignError;
+use crate::assign::{AssignError, AssignEvent, EVENT_KIND_ASSIGN};
 use crate::config::{Config, ConfigError};
 use crate::event::{Event, EventError};
 use crate::hash::{Hash, HashParseError};
@@ -246,15 +247,29 @@ fn write_root_pointer(
     Ok(())
 }
 
-/// Compute the root kinograph that would be produced from the given event
-/// set: for each identity, pick the head and emit one entry. Errors if any
-/// identity has multiple heads (forks must be resolved before compaction —
-/// phase 3 introduces assign events for this).
+/// Compute the root kinograph that would be produced for `root_name` from
+/// the given event set.
+///
+/// Routing rule per kino id:
+/// - zero live assigns → the kino routes to `inbox` (phase-3 default)
+/// - one live assign → the kino routes to that assign's `target_root`; if
+///   the target is not in `declared_roots`, `UnknownRoot` is raised.
+/// - two or more live assigns → `AmbiguousAssign` surfaces all candidates
+///
+/// Only kinos routed to `root_name` are included in the returned kinograph.
+/// Errors from the routing pass (`AmbiguousAssign`, `UnknownRoot`) bubble up
+/// regardless of which root is being compacted — an undeclared target is a
+/// global config/user problem that needs fixing before any root is clean.
 ///
 /// Events of kind `root` are skipped: a root kinograph represents the state
-/// of user content, not its own history (prior root versions are linked
-/// through the event chain, not re-entered into each successor).
-pub fn build_root(events: &[Event]) -> Result<RootKinograph, CompactError> {
+/// of user content, not its own history.
+pub fn build_root(
+    events: &[Event],
+    root_name: &str,
+    declared_roots: &BTreeSet<String>,
+) -> Result<RootKinograph, CompactError> {
+    let live_assigns = collect_live_assigns(events)?;
+
     let mut by_id: BTreeMap<String, Vec<&Event>> = BTreeMap::new();
     for e in events {
         if !e.is_store_event() {
@@ -268,6 +283,11 @@ pub fn build_root(events: &[Event]) -> Result<RootKinograph, CompactError> {
 
     let mut entries: Vec<RootEntry> = Vec::with_capacity(by_id.len());
     for (id, group) in by_id {
+        let target = kino_target_root(&id, &live_assigns, declared_roots)?;
+        let target_name = target.as_deref().unwrap_or("inbox");
+        if target_name != root_name {
+            continue;
+        }
         let head = pick_head(&id, &group)?;
         entries.push(RootEntry::new(
             head.id.clone(),
@@ -278,6 +298,84 @@ pub fn build_root(events: &[Event]) -> Result<RootKinograph, CompactError> {
     }
 
     Ok(RootKinograph { entries })
+}
+
+/// Collect the live assign set from the hot event stream.
+///
+/// An assign is **live** iff its event hash is not named in any other
+/// assign's `supersedes` list. Supersession is applied transitively via this
+/// single-pass rule: if A←B←C, then A is in some supersedes list (B's), and
+/// B is in some supersedes list (C's), so only C is live.
+///
+/// Returns `(event_hash, AssignEvent)` pairs so the caller can surface the
+/// persistent assign identity in error payloads without re-hashing.
+fn collect_live_assigns(
+    events: &[Event],
+) -> Result<Vec<(Hash, AssignEvent)>, CompactError> {
+    let mut all: Vec<(Hash, AssignEvent)> = Vec::new();
+    for e in events {
+        if e.event_kind != EVENT_KIND_ASSIGN {
+            continue;
+        }
+        let hash = e.event_hash()?;
+        let a = AssignEvent::from_event(e)?;
+        all.push((hash, a));
+    }
+    let superseded: HashSet<String> = all
+        .iter()
+        .flat_map(|(_, a)| a.supersedes.iter().cloned())
+        .collect();
+    Ok(all
+        .into_iter()
+        .filter(|(h, _)| !superseded.contains(h.as_hex()))
+        .collect())
+}
+
+/// Decide which root a single kino belongs to based on its live assigns.
+///
+/// - `Ok(Some(target))`: exactly one live assign pins the kino to `target`.
+///   `target` is guaranteed to be present in `declared_roots`.
+/// - `Ok(None)`: no live assigns touch this kino — caller treats this as
+///   default inbox routing.
+/// - `Err(AmbiguousAssign | UnknownRoot)`: surface the failure with enough
+///   detail for the CLI to render the D2 resolution hint.
+fn kino_target_root(
+    kino_id: &str,
+    live_assigns: &[(Hash, AssignEvent)],
+    declared_roots: &BTreeSet<String>,
+) -> Result<Option<String>, CompactError> {
+    let mine: Vec<&(Hash, AssignEvent)> = live_assigns
+        .iter()
+        .filter(|(_, a)| a.kino_id == kino_id)
+        .collect();
+    match mine.len() {
+        0 => Ok(None),
+        1 => {
+            let (h, a) = mine[0];
+            if !declared_roots.contains(&a.target_root) {
+                return Err(CompactError::UnknownRoot {
+                    name: a.target_root.clone(),
+                    event_hash: h.as_hex().to_owned(),
+                });
+            }
+            Ok(Some(a.target_root.clone()))
+        }
+        _ => {
+            let candidates = mine
+                .iter()
+                .map(|(h, a)| AssignCandidate {
+                    event_hash: h.as_hex().to_owned(),
+                    target_root: a.target_root.clone(),
+                    author: a.author.clone(),
+                    ts: a.ts.clone(),
+                })
+                .collect();
+            Err(CompactError::AmbiguousAssign {
+                kino_id: kino_id.to_owned(),
+                candidates,
+            })
+        }
+    }
 }
 
 fn pick_head<'a>(id: &str, events: &[&'a Event]) -> Result<&'a Event, CompactError> {
@@ -318,10 +416,15 @@ pub fn compact_root(
     validate_root_name(root_name)?;
     let prior_version = read_root_pointer(kinora_root, root_name)?;
 
+    let cfg_path = config_path(kinora_root);
+    let cfg_text = fs::read_to_string(&cfg_path)?;
+    let config = Config::from_styx(&cfg_text)?;
+    let declared_roots: BTreeSet<String> = config.roots.keys().cloned().collect();
+
     let ledger = Ledger::new(kinora_root);
     let events = ledger.read_all_events()?;
 
-    let root = build_root(&events)?;
+    let root = build_root(&events, root_name, &declared_roots)?;
     let new_bytes = root.to_styx()?.into_bytes();
 
     if let Some(prior) = &prior_version {
@@ -333,7 +436,11 @@ pub fn compact_root(
                 prior_version,
             });
         }
-    } else if events.is_empty() {
+    } else if root.entries.is_empty() {
+        // No kinos are routed here and no prior pointer exists — nothing to
+        // materialize. Previously keyed on `events.is_empty()`; now that
+        // routing excludes unrelated roots, key on the built kinograph's
+        // emptiness so a root with zero assigns still no-ops cleanly.
         return Ok(CompactResult {
             root_name: root_name.to_owned(),
             new_version: None,
@@ -463,7 +570,7 @@ mod tests {
         store_md(&root, b"b", "b", "2026-04-19T10:00:01Z");
 
         let result =
-            compact_root(&root, "main", params("yj", "2026-04-19T10:00:02Z")).unwrap();
+            compact_root(&root, "inbox", params("yj", "2026-04-19T10:00:02Z")).unwrap();
         let hash = result.new_version.expect("new version on genesis");
         assert!(result.prior_version.is_none());
 
@@ -479,14 +586,14 @@ mod tests {
         let (_t, root) = setup();
         store_md(&root, b"v1", "doc", "2026-04-19T10:00:00Z");
 
-        let first = compact_root(&root, "main", params("yj", "2026-04-19T10:00:01Z"))
+        let first = compact_root(&root, "inbox", params("yj", "2026-04-19T10:00:01Z"))
             .unwrap();
         let prior = first.new_version.unwrap();
 
         // Add a second kino so the second root differs.
         store_md(&root, b"second", "other", "2026-04-19T10:00:02Z");
 
-        let second = compact_root(&root, "main", params("yj", "2026-04-19T10:00:03Z"))
+        let second = compact_root(&root, "inbox", params("yj", "2026-04-19T10:00:03Z"))
             .unwrap();
         assert_eq!(second.prior_version.as_ref(), Some(&prior));
         let new = second.new_version.expect("new version after update");
@@ -510,19 +617,19 @@ mod tests {
     fn compact_is_no_op_when_nothing_new() {
         let (_t, root) = setup();
         store_md(&root, b"one", "only", "2026-04-19T10:00:00Z");
-        let first = compact_root(&root, "main", params("yj", "2026-04-19T10:00:01Z"))
+        let first = compact_root(&root, "inbox", params("yj", "2026-04-19T10:00:01Z"))
             .unwrap();
         let first_version = first.new_version.unwrap();
 
-        let pointer_before = fs::read(root_pointer_path(&root, "main")).unwrap();
+        let pointer_before = fs::read(root_pointer_path(&root, "inbox")).unwrap();
 
         // No new user events; different ts on the compact itself.
-        let second = compact_root(&root, "main", params("yj", "2026-04-19T10:05:00Z"))
+        let second = compact_root(&root, "inbox", params("yj", "2026-04-19T10:05:00Z"))
             .unwrap();
         assert!(second.new_version.is_none(), "should be no-op");
         assert_eq!(second.prior_version.unwrap(), first_version);
 
-        let pointer_after = fs::read(root_pointer_path(&root, "main")).unwrap();
+        let pointer_after = fs::read(root_pointer_path(&root, "inbox")).unwrap();
         assert_eq!(pointer_before, pointer_after, "pointer unchanged on no-op");
     }
 
@@ -533,11 +640,13 @@ mod tests {
         let (_t, root) = setup();
         store_md(&root, b"real", "doc", "2026-04-19T10:00:00Z");
 
-        // Forge a bogus event; if compact didn't filter, it would try to
-        // read its hash from the content store and fail.
+        // Forge an event with a future/unknown event_kind. It is neither a
+        // store event (so it must not land as a RootEntry) nor an assign
+        // (so it must not be interpreted as one either). Compact should
+        // tolerate it and still produce a clean root.
         let forged = Event {
-            event_kind: "assign".into(),
-            kind: "assign".into(),
+            event_kind: "future_kind".into(),
+            kind: "something::else".into(),
             id: "cc".repeat(32),
             hash: "dd".repeat(32),
             parents: vec![],
@@ -548,7 +657,7 @@ mod tests {
         };
         Ledger::new(&root).write_event(&forged).unwrap();
 
-        let result = compact_root(&root, "main", params("yj", "2026-04-19T10:00:05Z"))
+        let result = compact_root(&root, "inbox", params("yj", "2026-04-19T10:00:05Z"))
             .unwrap();
         let hash = result.new_version.expect("expected compaction to succeed");
         let bytes = ContentStore::new(&root).read(&hash).unwrap();
@@ -562,11 +671,11 @@ mod tests {
     #[test]
     fn compact_with_no_events_and_no_prior_is_no_op() {
         let (_t, root) = setup();
-        let result = compact_root(&root, "main", params("yj", "2026-04-19T10:00:00Z"))
+        let result = compact_root(&root, "inbox", params("yj", "2026-04-19T10:00:00Z"))
             .unwrap();
         assert!(result.new_version.is_none());
         assert!(result.prior_version.is_none());
-        assert!(!root_pointer_path(&root, "main").exists());
+        assert!(!root_pointer_path(&root, "inbox").exists());
     }
 
     #[test]
@@ -583,7 +692,7 @@ mod tests {
         let (_t1, root1) = setup();
         mk(&root1);
         let r1 =
-            compact_root(&root1, "main", params("alice", "2026-04-19T10:00:03Z"))
+            compact_root(&root1, "inbox", params("alice", "2026-04-19T10:00:03Z"))
                 .unwrap()
                 .new_version
                 .unwrap();
@@ -592,7 +701,7 @@ mod tests {
         mk(&root2);
         let r2 = compact_root(
             &root2,
-            "main",
+            "inbox",
             CompactParams {
                 author: "bob".into(),
                 provenance: "somewhere-else".into(),
@@ -616,7 +725,7 @@ mod tests {
         let b = store_md(&root, b"bb", "n2", "2026-04-19T10:00:01Z");
         let c = store_md(&root, b"cc", "n3", "2026-04-19T10:00:02Z");
 
-        let result = compact_root(&root, "main", params("yj", "2026-04-19T10:00:10Z"))
+        let result = compact_root(&root, "inbox", params("yj", "2026-04-19T10:00:10Z"))
             .unwrap();
         let blob = ContentStore::new(&root)
             .read(&result.new_version.unwrap())
@@ -632,10 +741,10 @@ mod tests {
     fn pointer_file_is_exactly_64_hex_no_trailing_whitespace() {
         let (_t, root) = setup();
         store_md(&root, b"x", "x", "2026-04-19T10:00:00Z");
-        let result = compact_root(&root, "main", params("yj", "2026-04-19T10:00:01Z"))
+        let result = compact_root(&root, "inbox", params("yj", "2026-04-19T10:00:01Z"))
             .unwrap();
         let hash = result.new_version.unwrap();
-        let pointer = fs::read_to_string(root_pointer_path(&root, "main")).unwrap();
+        let pointer = fs::read_to_string(root_pointer_path(&root, "inbox")).unwrap();
         assert_eq!(
             pointer,
             hash.as_hex(),
@@ -654,7 +763,7 @@ mod tests {
         let b = store_md(&root, b"b", "b", "2026-04-19T10:00:01Z");
         let c = store_md(&root, b"c", "c", "2026-04-19T10:00:02Z");
 
-        let first = compact_root(&root, "main", params("yj", "2026-04-19T10:00:03Z"))
+        let first = compact_root(&root, "inbox", params("yj", "2026-04-19T10:00:03Z"))
             .unwrap();
         let first_blob = ContentStore::new(&root)
             .read(&first.new_version.unwrap())
@@ -678,7 +787,7 @@ mod tests {
         )
         .unwrap();
 
-        let second = compact_root(&root, "main", params("yj", "2026-04-19T10:00:11Z"))
+        let second = compact_root(&root, "inbox", params("yj", "2026-04-19T10:00:11Z"))
             .unwrap();
         let second_blob = ContentStore::new(&root)
             .read(&second.new_version.unwrap())
@@ -709,15 +818,15 @@ mod tests {
     #[test]
     fn read_root_pointer_returns_none_when_absent() {
         let (_t, root) = setup();
-        assert!(read_root_pointer(&root, "main").unwrap().is_none());
+        assert!(read_root_pointer(&root, "inbox").unwrap().is_none());
     }
 
     #[test]
     fn read_root_pointer_rejects_invalid_body() {
         let (_t, root) = setup();
         fs::create_dir_all(roots_dir(&root)).unwrap();
-        fs::write(root_pointer_path(&root, "main"), "not-a-hash").unwrap();
-        let err = read_root_pointer(&root, "main").unwrap_err();
+        fs::write(root_pointer_path(&root, "inbox"), "not-a-hash").unwrap();
+        let err = read_root_pointer(&root, "inbox").unwrap_err();
         assert!(matches!(err, CompactError::InvalidPointer { .. }), "got: {err:?}");
     }
 
@@ -728,8 +837,8 @@ mod tests {
         let (_t, root) = setup();
         fs::create_dir_all(roots_dir(&root)).unwrap();
         let hash = "ab".repeat(32);
-        fs::write(root_pointer_path(&root, "main"), format!("{hash}\n")).unwrap();
-        let got = read_root_pointer(&root, "main").unwrap().unwrap();
+        fs::write(root_pointer_path(&root, "inbox"), format!("{hash}\n")).unwrap();
+        let got = read_root_pointer(&root, "inbox").unwrap().unwrap();
         assert_eq!(got.as_hex(), hash);
     }
 
@@ -764,7 +873,8 @@ mod tests {
         );
         let a = make(&"aa".repeat(32), vec!["bb".repeat(32)]);
         let b = make(&"bb".repeat(32), vec!["aa".repeat(32)]);
-        let err = build_root(&[a, b]).unwrap_err();
+        let declared: BTreeSet<String> = BTreeSet::from(["inbox".to_owned()]);
+        let err = build_root(&[a, b], "inbox", &declared).unwrap_err();
         assert!(matches!(err, CompactError::NoHead { .. }), "got: {err:?}");
     }
 
@@ -797,7 +907,7 @@ mod tests {
         }
 
         let err =
-            compact_root(&root, "main", params("yj", "2026-04-19T10:00:10Z")).unwrap_err();
+            compact_root(&root, "inbox", params("yj", "2026-04-19T10:00:10Z")).unwrap_err();
         assert!(matches!(err, CompactError::MultipleHeads { .. }), "got: {err:?}");
     }
 
@@ -854,15 +964,19 @@ roots {
 
         // Pre-populate `forked`'s pointer with a hash that isn't in the
         // content store — compact_root will fail to read the prior blob
-        // for byte-comparison. main and clean are untouched and must
-        // still advance to disk.
+        // for byte-comparison. main and clean each get an explicit assign
+        // so they produce non-empty root kinographs and must still advance
+        // to disk despite the sibling failure.
         fs::create_dir_all(roots_dir(&root)).unwrap();
         let bogus_hash = "ff".repeat(32);
         fs::write(root_pointer_path(&root, "forked"), &bogus_hash).unwrap();
 
-        store_md(&root, b"x", "x", "2026-04-19T10:00:00Z");
+        let km = store_md(&root, b"m", "m", "2026-04-19T10:00:00Z");
+        let kc = store_md(&root, b"c", "c", "2026-04-19T10:00:00Z");
+        write_assign_for(&root, &km.id, "main", vec![], "2026-04-19T10:00:01Z");
+        write_assign_for(&root, &kc.id, "clean", vec![], "2026-04-19T10:00:02Z");
 
-        let entries = compact_all(&root, params("yj", "2026-04-19T10:00:01Z")).unwrap();
+        let entries = compact_all(&root, params("yj", "2026-04-19T10:00:03Z")).unwrap();
         let by_name: std::collections::HashMap<_, _> = entries
             .iter()
             .map(|(n, r)| (n.clone(), r))

@@ -160,6 +160,32 @@ mod tests {
         }
     }
 
+    /// Overwrite `.kinora/config.styx` to declare `main` as a root.
+    /// Needed for tests that route kinos into `main` via explicit assigns —
+    /// the default config only auto-provisions `inbox`.
+    fn declare_main_root(kin: &std::path::Path) {
+        std::fs::write(
+            kinora::paths::config_path(kin),
+            "repo-url \"https://github.com/edger-dev/kinora\"\nroots {\n  main { policy \"never\" }\n}\n",
+        )
+        .unwrap();
+    }
+
+    fn assign_to(kin: &std::path::Path, kino_id: &str, target_root: &str) {
+        kinora::assign::write_assign(
+            kin,
+            &kinora::assign::AssignEvent {
+                kino_id: kino_id.to_owned(),
+                target_root: target_root.to_owned(),
+                supersedes: vec![],
+                author: "yj".into(),
+                ts: "2026-04-18T10:00:01Z".into(),
+                provenance: "test".into(),
+            },
+        )
+        .unwrap();
+    }
+
     #[test]
     fn render_writes_pages_under_override_cache_dir() {
         let tmp = repo();
@@ -269,7 +295,9 @@ mod tests {
     fn build_owners_map_ignores_tmp_and_non_file_entries() {
         let tmp = repo();
         let kin = kinora_root(tmp.path());
-        store_kino(&kin, params(b"alpha", "alpha")).unwrap();
+        declare_main_root(&kin);
+        let ev = store_kino(&kin, params(b"alpha", "alpha")).unwrap();
+        assign_to(&kin, &ev.event.id, "main");
         compact_root(&kin, "main", compact_params()).unwrap();
 
         // Simulate a leftover tmp pointer and a stray subdir under roots/.
@@ -286,9 +314,12 @@ mod tests {
     fn build_owners_map_maps_entries_to_root_name() {
         let tmp = repo();
         let kin = kinora_root(tmp.path());
+        declare_main_root(&kin);
 
         let ev1 = store_kino(&kin, params(b"alpha", "alpha")).unwrap();
         let ev2 = store_kino(&kin, params(b"beta", "beta")).unwrap();
+        assign_to(&kin, &ev1.event.id, "main");
+        assign_to(&kin, &ev2.event.id, "main");
 
         compact_root(&kin, "main", compact_params()).unwrap();
 
@@ -322,8 +353,11 @@ mod tests {
     fn render_compacted_main_groups_under_main() {
         let tmp = repo();
         let kin = kinora_root(tmp.path());
-        store_kino(&kin, params(b"# a\n", "alpha")).unwrap();
-        store_kino(&kin, params(b"# b\n", "beta")).unwrap();
+        declare_main_root(&kin);
+        let a = store_kino(&kin, params(b"# a\n", "alpha")).unwrap();
+        let b = store_kino(&kin, params(b"# b\n", "beta")).unwrap();
+        assign_to(&kin, &a.event.id, "main");
+        assign_to(&kin, &b.event.id, "main");
         compact_root(&kin, "main", compact_params()).unwrap();
 
         let cache = TempDir::new().unwrap();
@@ -340,8 +374,11 @@ mod tests {
     fn render_mixed_repo_splits_between_main_and_unreferenced() {
         let tmp = repo();
         let kin = kinora_root(tmp.path());
-        store_kino(&kin, params(b"# a\n", "alpha")).unwrap();
-        store_kino(&kin, params(b"# b\n", "beta")).unwrap();
+        declare_main_root(&kin);
+        let a = store_kino(&kin, params(b"# a\n", "alpha")).unwrap();
+        let b = store_kino(&kin, params(b"# b\n", "beta")).unwrap();
+        assign_to(&kin, &a.event.id, "main");
+        assign_to(&kin, &b.event.id, "main");
         compact_root(&kin, "main", compact_params()).unwrap();
 
         // Add a post-compact kino that isn't owned by any root yet.

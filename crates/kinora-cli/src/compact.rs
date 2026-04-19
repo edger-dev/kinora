@@ -73,7 +73,7 @@ mod tests {
         }
     }
 
-    fn store_md(root: &std::path::Path, content: &[u8], name: &str) {
+    fn store_md(root: &std::path::Path, content: &[u8], name: &str) -> kinora::event::Event {
         store_kino(
             root,
             StoreKinoParams {
@@ -85,6 +85,22 @@ mod tests {
                 metadata: BTreeMap::from([("name".into(), name.into())]),
                 id: None,
                 parents: vec![],
+            },
+        )
+        .unwrap()
+        .event
+    }
+
+    fn assign_to(root: &std::path::Path, kino_id: &str, target_root: &str) {
+        kinora::assign::write_assign(
+            root,
+            &kinora::assign::AssignEvent {
+                kino_id: kino_id.to_owned(),
+                target_root: target_root.to_owned(),
+                supersedes: vec![],
+                author: "yj".into(),
+                ts: "2026-04-19T10:00:01Z".into(),
+                provenance: "cli-test".into(),
             },
         )
         .unwrap();
@@ -103,7 +119,11 @@ mod tests {
     fn run_compact_without_root_flag_compacts_every_declared_root() {
         let (tmp, kin) = repo();
         write_multi_root_config(&kin, &["main", "rfcs"]);
-        store_md(&kin, b"x", "x");
+        // Assign one kino to main and one to rfcs so both advance to disk.
+        let a = store_md(&kin, b"a", "a");
+        let b = store_md(&kin, b"b", "b");
+        assign_to(&kin, &a.id, "main");
+        assign_to(&kin, &b.id, "rfcs");
 
         let report = run_compact(tmp.path(), args()).unwrap();
         // inbox is auto-provisioned in Config::from_styx when absent.
