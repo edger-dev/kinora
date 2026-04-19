@@ -5,7 +5,7 @@ status: todo
 type: feature
 priority: normal
 created_at: 2026-04-19T07:47:10Z
-updated_at: 2026-04-19T08:10:12Z
+updated_at: 2026-04-19T10:19:29Z
 parent: kinora-xi21
 blocked_by:
     - kinora-61f9
@@ -123,3 +123,25 @@ Exit code is 0 iff every root succeeded (new version or no-op). Any root errorin
 ## Provenance
 
 Broken out of `kinora-xi21` (phase 3) on 2026-04-19 following the per-root render decision for kinora-ml4t.
+
+## Decomposition (2026-04-19)
+
+Phase 3 is broken into 7 child tasks. Each is shift-sized and produces a clean commit boundary. Dependencies are enforced via `--blocked-by`; the natural `beans list --ready` ordering surfaces them correctly.
+
+| # | Bean | Scope | Blocked by |
+|---|------|-------|------------|
+| 1 | kinora-c48l | Config `roots {}` block + inbox auto-provision (D1) | — |
+| 2 | kinora-szkl | Event schema generalization (store vs non-store events) | — |
+| 3 | kinora-g08g | Assign event + `kinora assign` CLI + `store --root` atomic pair (D2, D3) | #2 |
+| 4 | kinora-l79b | Compact library split (`compact_root` / `compact_all`) + always-all CLI (D5) | #1 |
+| 5 | kinora-7mou | Compact consumes assigns + AmbiguousAssign + UnknownRoot errors (D2, D4) | #3, #4 |
+| 6 | kinora-mngq | GC/prune per policy + pin support | #1, #4 |
+| 7 | kinora-f0rg | Cross-root integrity (external refs prevent GC drops) | #6 |
+
+### Critical path
+
+The user-visible "assign a kino to a root" experience needs #1 → #2 → #3 → #4 → #5 (five shifts). GC and integrity (#6, #7) can land after the assign path works end-to-end.
+
+### Parallelism
+
+#1 and #2 have no inter-dependency and can run concurrently. After #1 lands, #4 unblocks. After #2 lands, #3 unblocks. #3+#4 together unblock #5.
