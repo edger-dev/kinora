@@ -1,11 +1,11 @@
 ---
 # kinora-hxmw
 title: 'Phase 3: multiple named roots + assign event + per-root GC'
-status: todo
+status: completed
 type: feature
 priority: normal
 created_at: 2026-04-19T07:47:10Z
-updated_at: 2026-04-19T10:19:29Z
+updated_at: 2026-04-19T13:19:28Z
 parent: kinora-xi21
 blocked_by:
     - kinora-61f9
@@ -25,21 +25,21 @@ Under xi21 §7–§8, a kino's metadata home is its leaf in its **owning** root 
 
 ### In scope
 
-- [ ] Config: declare named roots under a `roots {}` block in `config.styx` with per-root policies (e.g. `never`, `30d`, `keep-last-N`) — see D1
-- [ ] Auto-provision `inbox` as default root if not declared
-- [ ] Event schema: generalize hot-ledger events to include non-store event kinds (today every hot event is a store event)
-- [ ] `assign` event type: `{ kind: "assign", kino_id, target_root, supersedes: Vec<String>, author, ts, provenance }` — `supersedes` list may be empty — see D2
-- [ ] `kinora assign <kino-or-name> <root> [--resolves <hashes,...>]` CLI command — writes an assign event to the hot ledger; `--resolves` populates `supersedes`
-- [ ] `kinora store --root <name>` flag: when set to anything other than the implicit inbox default, writes an explicit birth-assign event alongside the store event (atomic pair) — see D3
-- [ ] Compaction consumes live assign events (where live = not superseded): when compacting root Y, include kinos with a live `assign → Y`; remove from root X in that same compaction pass
-- [ ] `kinora compact` always compacts **all** declared roots; no `--root` flag; per-root errors do not block clean roots — see D5
-- [ ] `AmbiguousAssign` error when a kino has ≥2 live pending assigns — see D2
-- [ ] `UnknownRoot` error when an assign references a root not in `config.styx` — see D4
-- [ ] Library API: split phase-2B's `compact` into `compact_root` (per-root, testable) and `compact_all` (batch, CLI-facing) — see D5
-- [ ] GC/prune: each root's compaction prunes hot events older than its policy, plus drops entries whose content versions are older than policy and not pinned
-- [ ] Pin support: `pin: true` on a root entry exempts it from GC
-- [ ] Cross-root integrity: if root A references (via composition) a kino owned by root B, B's GC must not drop that version; enforced at compact time
-- [ ] Tests cover: assign event round-trip, `supersedes` resolution, ambiguous-assign error, unknown-root error, multi-root compact determinism, per-root error isolation, inbox auto-provision, birth-with-`--root` atomic pair, GC drops aged entries, pin exempts, cross-root pin enforcement
+- [x] Config: declare named roots under a `roots {}` block in `config.styx` with per-root policies (e.g. `never`, `30d`, `keep-last-N`) — see D1 (kinora-c48l)
+- [x] Auto-provision `inbox` as default root if not declared (kinora-c48l)
+- [x] Event schema: generalize hot-ledger events to include non-store event kinds (today every hot event is a store event) (kinora-szkl)
+- [x] `assign` event type: `{ kind: "assign", kino_id, target_root, supersedes: Vec<String>, author, ts, provenance }` — `supersedes` list may be empty — see D2 (kinora-g08g)
+- [x] `kinora assign <kino-or-name> <root> [--resolves <hashes,...>]` CLI command — writes an assign event to the hot ledger; `--resolves` populates `supersedes` (kinora-g08g)
+- [x] `kinora store --root <name>` flag: when set to anything other than the implicit inbox default, writes an explicit birth-assign event alongside the store event (atomic pair) — see D3 (kinora-g08g)
+- [x] Compaction consumes live assign events (where live = not superseded): when compacting root Y, include kinos with a live `assign → Y`; remove from root X in that same compaction pass (kinora-7mou)
+- [x] `kinora compact` always compacts **all** declared roots; no `--root` flag; per-root errors do not block clean roots — see D5 (kinora-l79b)
+- [x] `AmbiguousAssign` error when a kino has ≥2 live pending assigns — see D2 (kinora-7mou)
+- [x] `UnknownRoot` error when an assign references a root not in `config.styx` — see D4 (kinora-7mou)
+- [x] Library API: split phase-2B's `compact` into `compact_root` (per-root, testable) and `compact_all` (batch, CLI-facing) — see D5 (kinora-l79b)
+- [x] GC/prune: each root's compaction prunes hot events older than its policy, plus drops entries whose content versions are older than policy and not pinned (kinora-mngq)
+- [x] Pin support: `pin: true` on a root entry exempts it from GC (kinora-mngq)
+- [x] Cross-root integrity: if root A references (via composition) a kino owned by root B, B's GC must not drop that version; enforced at compact time (kinora-f0rg)
+- [x] Tests cover: assign event round-trip, `supersedes` resolution, ambiguous-assign error, unknown-root error, multi-root compact determinism, per-root error isolation, inbox auto-provision, birth-with-`--root` atomic pair, GC drops aged entries, pin exempts, cross-root pin enforcement (distributed across children)
 
 ### Out of scope (deferred)
 
@@ -113,12 +113,12 @@ Exit code is 0 iff every root succeeded (new version or no-op). Any root errorin
 
 ## Acceptance
 
-- [ ] All sub-points under "In scope" implemented with tests
-- [ ] Phase-2B's `compact_root` library fn kept intact (renamed from `compact`) so the library API is backward compatible; the `--root` CLI flag is retired in favour of always-all (see D5)
-- [ ] Rendering (kinora-ml4t) can group by owning root unambiguously — every kino has exactly one owning root post-phase-3
-- [ ] Zero compiler warnings
-- [ ] Bean todo items all checked off
-- [ ] Summary of Changes section added at completion
+- [x] All sub-points under "In scope" implemented with tests
+- [x] Phase-2B's `compact_root` library fn kept intact (renamed from `compact`) so the library API is backward compatible; the `--root` CLI flag is retired in favour of always-all (see D5)
+- [x] Rendering (kinora-ml4t) can group by owning root unambiguously — every kino has exactly one owning root post-phase-3
+- [x] Zero compiler warnings
+- [x] Bean todo items all checked off
+- [x] Summary of Changes section added at completion
 
 ## Provenance
 
@@ -145,3 +145,35 @@ The user-visible "assign a kino to a root" experience needs #1 → #2 → #3 →
 ### Parallelism
 
 #1 and #2 have no inter-dependency and can run concurrently. After #1 lands, #4 unblocks. After #2 lands, #3 unblocks. #3+#4 together unblock #5.
+
+## Summary of Changes
+
+Phase 3 landed across 7 completed child beans. See each child's Summary of Changes for commit-level detail; this summary reports the combined state.
+
+### Children (all completed)
+
+| # | Bean | Title |
+|---|------|-------|
+| 1 | kinora-c48l | Config `roots {}` block + inbox auto-provision |
+| 2 | kinora-szkl | Event schema generalization (store vs non-store events) |
+| 3 | kinora-g08g | Assign event + `kinora assign` CLI + `store --root` atomic pair |
+| 4 | kinora-l79b | Compact library split (`compact_root` / `compact_all`) + always-all CLI |
+| 5 | kinora-7mou | Compact consumes assigns + AmbiguousAssign + UnknownRoot errors |
+| 6 | kinora-mngq | GC/prune per policy + pin support |
+| 7 | kinora-f0rg | Cross-root integrity (external refs prevent GC drops) |
+
+### Shape delivered
+
+- Named roots: declared under `roots {}` in `config.styx` with per-root policies (`never`, `MaxAge(d)`, `KeepLastN(n)`). `inbox` auto-provisions.
+- `assign` event: full round-trip (CLI `kinora assign`, library `AssignEvent`, `supersedes` chain resolution via `collect_live_assigns`). Birth-into-non-default-root via `kinora store --root` writes an atomic store+assign pair.
+- `compact_root(name, …)` / `compact_all(…)` library split. CLI `kinora compact` takes no `--root` flag; always compacts every declared root, with per-root errors rendered as D2-style blocks without aborting the batch. `AmbiguousAssign` and `UnknownRoot` surface with copy-pasteable resolution hints.
+- GC/prune: `RootPolicy::max_age_seconds()` drives both root-entry GC (MaxAge drops old unpinned entries) and hot-ledger prune (MaxAge + KeepLastN drop old or excess store events, assigns age out by MaxAge only). `pin: true` propagates across rebuilds via `propagate_pins`.
+- Cross-root integrity: `ExternalRefs::collect` snapshots every declared root's composition kinograph pointers (once per `compact_all` batch, or per-call for standalone `compact_root`). `(id, version)` pairs referenced by other roots are treated as implicitly pinned — GC and hot-prune both protect them. `CompactResult.retained_by_cross_root` surfaces the retention report; CLI renders it as a trailing clause on the compact output line.
+
+### Tests
+
+301 library + 81 CLI tests pass, zero compiler warnings. Child beans carry the per-phase test inventories.
+
+### Rendering downstream
+
+Phase 3 satisfies the precondition for `kinora-ml4t` (per-root rendering): every kino has exactly one owning root post-compact, so d2 grouping is unambiguous.
