@@ -84,6 +84,19 @@ fn run() -> ExitCode {
         }
     };
 
+    // Resolve the effective repo root once, honoring the global `-C` /
+    // `--repo-root` flag. Each `run_*` still calls `find_repo_root` on
+    // the path we pass in — when a root is already resolved, the walk-up
+    // returns on the first iteration, so the extra work is negligible.
+    let effective_cwd = match common::resolve_repo_root(
+        &cwd,
+        cli.repo_root.as_deref().map(std::path::Path::new),
+    ) {
+        Ok(p) => p,
+        Err(e) => return report_err("repo-root", e),
+    };
+    let cwd = effective_cwd;
+
     match cli.command {
         Command::Store {
             kind,

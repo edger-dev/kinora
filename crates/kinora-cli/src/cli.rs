@@ -3,6 +3,12 @@ use figue::{self as args, FigueBuiltins};
 
 #[derive(Facet, Debug)]
 pub struct Cli {
+    /// Operate on the kinora repo rooted at this path instead of walking
+    /// up from the current directory. `.kinora/` must exist directly
+    /// under it; no walk-up is performed.
+    #[facet(args::named, args::short = 'C', default)]
+    pub repo_root: Option<String>,
+
     #[facet(args::subcommand)]
     pub command: Command,
 

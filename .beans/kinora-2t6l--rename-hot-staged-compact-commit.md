@@ -1,11 +1,11 @@
 ---
 # kinora-2t6l
 title: 'Rename: hot → staged, compact → commit'
-status: in-progress
+status: completed
 type: task
 priority: normal
 created_at: 2026-04-19T14:39:05Z
-updated_at: 2026-04-19T15:36:35Z
+updated_at: 2026-04-19T15:37:50Z
 ---
 
 ## Why
@@ -43,3 +43,20 @@ Pure rename only — **no** lifecycle change in this bean. Staged events remain 
 - Zero compiler warnings
 - `kinora commit` works identically to the old `kinora compact`
 - No residual `hot`/`compact` identifier in library code (hard rename, no transitional aliases — repo is days old, no external users)
+
+## Summary of Changes
+
+Pure mechanical rename across the Rust workspace:
+
+- **Paths**: `HOT_DIR` → `STAGED_DIR`, `hot_dir()` → `staged_dir()`, `hot_event_path()` → `staged_event_path()`, string literal value `"hot"` → `"staged"`.
+- **Module/files**: `compact.rs` → `commit.rs` in both `kinora` and `kinora-cli` crates (including module declarations in `lib.rs` and `main.rs`).
+- **Types**: `CompactError` → `CommitError`, `CompactParams` → `CommitParams`, `CompactResult` → `CommitResult`, `CompactAllEntry` → `CommitAllEntry`, `CompactRunArgs` → `CommitRunArgs`, `CompactRunReport` → `CommitRunReport`. All error variants preserved.
+- **Functions**: `run_compact` → `run_commit`, `compact_all` → `commit_all`, `compact_root` → `commit_root`, `render_compact_entry` → `render_commit_entry`, `render_compact_error` → `render_commit_error`.
+- **CLI**: subcommand `compact` → `commit` (`Command::Compact` variant → `Command::Commit`).
+- **Dogfood repo**: renamed `.kinora/hot/` → `.kinora/staged/` in place (`git mv` preserved all staged event files).
+
+Execution: three sed passes (word-boundary, compound identifiers, unbounded), then fixed one false-positive rename (`snapshot` → `snapsstaged` → restored to `snapshot`), then renamed a doubled test name (`staged_dir_is_staged_subdir` → `staged_dir_is_staged_subdir_of_kinora_root`).
+
+No README, CLAUDE.md, or RFC references needed updating (none found).
+
+Result: 382 tests pass, zero compiler warnings, independent subagent review found no missed references, mangled substrings, or doc-comment incoherence. Commit `3e1a0ae` (approx) on main.

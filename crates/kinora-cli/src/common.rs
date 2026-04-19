@@ -66,6 +66,27 @@ pub fn find_repo_root(start: &Path) -> Result<PathBuf, CliError> {
     }
 }
 
+/// Resolve the repo root for a CLI invocation.
+///
+/// When `override_path` is `Some`, treat it verbatim as the repo root and
+/// require `.kinora/` to sit directly under it — no walk-up. When `None`,
+/// fall back to walking up from `cwd` via [`find_repo_root`].
+///
+/// This is the entry point main.rs uses for the global `--repo-root` /
+/// `-C` flag; tests exercise both branches directly.
+pub fn resolve_repo_root(cwd: &Path, override_path: Option<&Path>) -> Result<PathBuf, CliError> {
+    match override_path {
+        Some(p) => {
+            if p.join(KINORA_DIR).is_dir() {
+                Ok(p.to_path_buf())
+            } else {
+                Err(CliError::NotInKinoraRepo { start: p.to_path_buf() })
+            }
+        }
+        None => find_repo_root(cwd),
+    }
+}
+
 /// Parse a single `KEY=VALUE` string. The key is trimmed; empty keys
 /// are rejected. The value may be empty (explicit empty string) and may
 /// contain `=` (split on the first `=` only).
@@ -122,6 +143,44 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let err = find_repo_root(tmp.path()).unwrap_err();
         assert!(matches!(err, CliError::NotInKinoraRepo { .. }));
+    }
+
+    #[test]
+    fn resolve_repo_root_override_returns_verbatim_when_kinora_present() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join(KINORA_DIR)).unwrap();
+        let resolved = resolve_repo_root(Path::new("/unused"), Some(tmp.path())).unwrap();
+        assert_eq!(resolved, tmp.path());
+    }
+
+    #[test]
+    fn resolve_repo_root_override_does_not_walk_up() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join(KINORA_DIR)).unwrap();
+        let nested = tmp.path().join("a").join("b");
+        fs::create_dir_all(&nested).unwrap();
+        let err = resolve_repo_root(tmp.path(), Some(&nested)).unwrap_err();
+        match err {
+            CliError::NotInKinoraRepo { start } => assert_eq!(start, nested),
+            other => panic!("expected NotInKinoraRepo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_repo_root_override_errors_for_nonexistent_path() {
+        let err =
+            resolve_repo_root(Path::new("/unused"), Some(Path::new("/nonexistent"))).unwrap_err();
+        assert!(matches!(err, CliError::NotInKinoraRepo { .. }));
+    }
+
+    #[test]
+    fn resolve_repo_root_none_walks_up_from_cwd() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join(KINORA_DIR)).unwrap();
+        let nested = tmp.path().join("a").join("b");
+        fs::create_dir_all(&nested).unwrap();
+        let resolved = resolve_repo_root(&nested, None).unwrap();
+        assert_eq!(resolved, tmp.path());
     }
 
     #[test]
