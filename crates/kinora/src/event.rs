@@ -120,13 +120,37 @@ impl Event {
         Ok(s)
     }
 
+    /// Parse a single ledger JSON line.
+    ///
+    /// New-shape events (with `event_kind`) parse directly. Pre-phase-3
+    /// lines (no `event_kind`) fall back to `LegacyEvent` and promote with
+    /// `event_kind = "store"`. The fallback is triggered **only** when the
+    /// primary parse fails specifically because `event_kind` is missing —
+    /// a new-shape line with other errors (wrong type on some field, bad
+    /// JSON) surfaces its real error rather than being masked by a
+    /// spurious legacy promotion.
+    ///
+    /// Identity semantics: a legacy event's on-disk filename is derived
+    /// from its *legacy* canonical form (no `event_kind`), but
+    /// `Event::event_hash()` after promotion uses the *new* canonical
+    /// form. Re-hashing a promoted legacy event therefore yields a
+    /// different hash than its on-disk filename — the invariant
+    /// `file_path == event_hash` only holds for events written by
+    /// `Ledger::write_event` after the phase-3 cutover.
     pub fn from_json_line(line: &str) -> Result<Self, EventError> {
         match facet_json::from_str::<Self>(line) {
             Ok(e) => Ok(e),
-            Err(primary) => match facet_json::from_str::<LegacyEvent>(line) {
-                Ok(legacy) => Ok(Event::from(legacy)),
-                Err(_) => Err(EventError::Parse(primary.to_string())),
-            },
+            Err(primary) => {
+                let msg = primary.to_string();
+                if msg.contains("missing field `event_kind`") {
+                    match facet_json::from_str::<LegacyEvent>(line) {
+                        Ok(legacy) => Ok(Event::from(legacy)),
+                        Err(_) => Err(EventError::Parse(msg)),
+                    }
+                } else {
+                    Err(EventError::Parse(msg))
+                }
+            }
         }
     }
 
@@ -213,6 +237,23 @@ mod tests {
         let mut e = sample_event();
         e.event_kind = "assign".into();
         assert!(!e.is_store_event());
+    }
+
+    #[test]
+    fn malformed_new_shape_event_does_not_fall_back_to_legacy() {
+        // A line that *has* `event_kind` but is otherwise malformed (wrong
+        // type on some other field) must surface its real parse error
+        // rather than silently promote to a store event.
+        let bad = r#"{"event_kind":"assign","kind":"markdown","id":"aa","hash":"aa","parents":[],"ts":"2026-04-18T09:20:00Z","author":"yj","provenance":"test","metadata":"not-a-map"}"#;
+        let err = Event::from_json_line(bad).unwrap_err();
+        let msg = match err {
+            EventError::Parse(m) => m,
+            other => panic!("expected Parse, got {other:?}"),
+        };
+        assert!(
+            !msg.contains("missing field `event_kind`"),
+            "primary error should not be a missing-field error: {msg}"
+        );
     }
 
     #[test]
