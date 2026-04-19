@@ -64,6 +64,35 @@ impl RootPolicy {
             RootPolicy::KeepLastN(n) => format!("keep-last-{n}"),
         }
     }
+
+    /// For `MaxAge(raw)`, return the duration in seconds. Grammar matches
+    /// `from_policy_str`: a non-empty digit prefix followed by one of
+    /// `s|m|h|d|w|y`. Calendar-agnostic: `y = 365d`, `w = 7d`, `d = 24h`,
+    /// `h = 60m`, `m = 60s`. Returns `None` for `Never` / `KeepLastN`, or
+    /// if the raw string is malformed (shouldn't happen — `from_policy_str`
+    /// already validated it, but be defensive).
+    pub fn max_age_seconds(&self) -> Option<i64> {
+        let raw = match self {
+            RootPolicy::MaxAge(s) => s,
+            _ => return None,
+        };
+        let digit_end = raw.bytes().take_while(|b| b.is_ascii_digit()).count();
+        if digit_end == 0 || digit_end == raw.len() {
+            return None;
+        }
+        let n: i64 = raw[..digit_end].parse().ok()?;
+        let unit = raw.as_bytes().get(digit_end).copied()?;
+        let factor: i64 = match unit {
+            b's' => 1,
+            b'm' => 60,
+            b'h' => 60 * 60,
+            b'd' => 24 * 60 * 60,
+            b'w' => 7 * 24 * 60 * 60,
+            b'y' => 365 * 24 * 60 * 60,
+            _ => return None,
+        };
+        n.checked_mul(factor)
+    }
 }
 
 /// Raw on-disk shape of the `roots { <name> { policy "<s>" } ... }` block.

@@ -24,12 +24,12 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use crate::assign::{AssignError, AssignEvent, EVENT_KIND_ASSIGN};
-use crate::config::{Config, ConfigError};
+use crate::config::{Config, ConfigError, RootPolicy};
 use crate::event::{Event, EventError};
 use crate::hash::{Hash, HashParseError};
 use crate::kino::{store_kino, StoreKinoError, StoreKinoParams};
 use crate::ledger::{Ledger, LedgerError};
-use crate::paths::{config_path, root_pointer_path, roots_dir};
+use crate::paths::{config_path, hot_event_path, root_pointer_path, roots_dir};
 use crate::root::{RootEntry, RootError, RootKinograph};
 use crate::store::{ContentStore, StoreError};
 
@@ -420,73 +420,324 @@ pub fn compact_root(
     let cfg_text = fs::read_to_string(&cfg_path)?;
     let config = Config::from_styx(&cfg_text)?;
     let declared_roots: BTreeSet<String> = config.roots.keys().cloned().collect();
+    let policy = config
+        .roots
+        .get(root_name)
+        .cloned()
+        .unwrap_or(RootPolicy::Never);
 
     let ledger = Ledger::new(kinora_root);
     let events = ledger.read_all_events()?;
 
-    let root = build_root(&events, root_name, &declared_roots)?;
+    let mut root = build_root(&events, root_name, &declared_roots)?;
+
+    // Load prior root kinograph (if any) so we can carry pinned entries
+    // forward. Pinned entries survive rebuilds verbatim for kinos still
+    // owned by this root — this preserves hand-edits to the pin/version
+    // fields across compacts.
+    let prior_root: Option<RootKinograph> = match &prior_version {
+        Some(h) => Some(RootKinograph::parse(
+            &ContentStore::new(kinora_root).read(h)?,
+        )?),
+        None => None,
+    };
+    propagate_pins(&mut root, prior_root.as_ref());
+
+    // Policy-driven root-entry GC. MaxAge drops unpinned entries whose head
+    // ts is older than the cutoff; Never and KeepLastN leave entries alone.
+    apply_root_entry_gc(&mut root, &events, &policy, &params.ts)?;
+
     let new_bytes = root.to_styx()?.into_bytes();
 
-    if let Some(prior) = &prior_version {
-        let prior_bytes = ContentStore::new(kinora_root).read(prior)?;
-        if prior_bytes == new_bytes {
-            return Ok(CompactResult {
-                root_name: root_name.to_owned(),
-                new_version: None,
-                prior_version,
-            });
-        }
-    } else if root.entries.is_empty() {
-        // No kinos are routed here and no prior pointer exists — nothing to
-        // materialize. Previously keyed on `events.is_empty()`; now that
-        // routing excludes unrelated roots, key on the built kinograph's
-        // emptiness so a root with zero assigns still no-ops cleanly.
-        return Ok(CompactResult {
-            root_name: root_name.to_owned(),
-            new_version: None,
-            prior_version,
-        });
-    }
-
-    let (id, parents) = match &prior_version {
+    let result = match &prior_version {
         Some(prior) => {
-            let prior_event = events
-                .iter()
-                .find(|e| e.hash == prior.as_hex())
-                .ok_or_else(|| CompactError::PriorEventMissing {
-                    version: prior.as_hex().to_owned(),
+            let prior_bytes = ContentStore::new(kinora_root).read(prior)?;
+            if prior_bytes == new_bytes {
+                CompactResult {
+                    root_name: root_name.to_owned(),
+                    new_version: None,
+                    prior_version: prior_version.clone(),
+                }
+            } else {
+                let prior_event = events
+                    .iter()
+                    .find(|e| e.hash == prior.as_hex())
+                    .ok_or_else(|| CompactError::PriorEventMissing {
+                        version: prior.as_hex().to_owned(),
+                    })?;
+                let stored = store_kino(
+                    kinora_root,
+                    StoreKinoParams {
+                        kind: "root".into(),
+                        content: new_bytes,
+                        author: params.author.clone(),
+                        provenance: params.provenance.clone(),
+                        ts: params.ts.clone(),
+                        metadata: BTreeMap::new(),
+                        id: Some(prior_event.id.clone()),
+                        parents: vec![prior.as_hex().to_owned()],
+                    },
+                )?;
+                let new_hash = Hash::from_str(&stored.event.hash).map_err(|err| {
+                    CompactError::InvalidHash {
+                        value: stored.event.hash.clone(),
+                        err,
+                    }
                 })?;
-            (Some(prior_event.id.clone()), vec![prior.as_hex().to_owned()])
+                write_root_pointer(kinora_root, root_name, &new_hash)?;
+                CompactResult {
+                    root_name: root_name.to_owned(),
+                    new_version: Some(new_hash),
+                    prior_version: prior_version.clone(),
+                }
+            }
         }
-        None => (None, vec![]),
+        None => {
+            if root.entries.is_empty() {
+                CompactResult {
+                    root_name: root_name.to_owned(),
+                    new_version: None,
+                    prior_version: None,
+                }
+            } else {
+                let stored = store_kino(
+                    kinora_root,
+                    StoreKinoParams {
+                        kind: "root".into(),
+                        content: new_bytes,
+                        author: params.author.clone(),
+                        provenance: params.provenance.clone(),
+                        ts: params.ts.clone(),
+                        metadata: BTreeMap::new(),
+                        id: None,
+                        parents: vec![],
+                    },
+                )?;
+                let new_hash = Hash::from_str(&stored.event.hash).map_err(|err| {
+                    CompactError::InvalidHash {
+                        value: stored.event.hash.clone(),
+                        err,
+                    }
+                })?;
+                write_root_pointer(kinora_root, root_name, &new_hash)?;
+                CompactResult {
+                    root_name: root_name.to_owned(),
+                    new_version: Some(new_hash),
+                    prior_version: None,
+                }
+            }
+        }
     };
 
-    let stored = store_kino(
+    // Prune hot events owned by this root per policy. Runs after the pointer
+    // write so a crash mid-prune leaves the ledger larger than strictly
+    // required (safe) rather than smaller than the pointer can resolve.
+    prune_hot_events(
         kinora_root,
-        StoreKinoParams {
-            kind: "root".into(),
-            content: new_bytes,
-            author: params.author,
-            provenance: params.provenance,
-            ts: params.ts,
-            metadata: BTreeMap::new(),
-            id,
-            parents,
-        },
+        &events,
+        root_name,
+        &declared_roots,
+        &root,
+        &policy,
+        &params.ts,
     )?;
 
-    let new_hash =
-        Hash::from_str(&stored.event.hash).map_err(|err| CompactError::InvalidHash {
-            value: stored.event.hash.clone(),
-            err,
-        })?;
-    write_root_pointer(kinora_root, root_name, &new_hash)?;
+    Ok(result)
+}
 
-    Ok(CompactResult {
-        root_name: root_name.to_owned(),
-        new_version: Some(new_hash),
-        prior_version,
-    })
+/// Copy `pin` + `version` from prior root's entries into the freshly built
+/// root, for kinos still owned by this root. Unpinned prior entries are
+/// ignored — the rebuilt head already represents them. A kino reassigned
+/// away from this root simply won't appear in the rebuild, so ownership
+/// wins over pin on cross-root moves.
+fn propagate_pins(root: &mut RootKinograph, prior: Option<&RootKinograph>) {
+    let Some(prior) = prior else { return };
+    let pinned: BTreeMap<&str, &RootEntry> = prior
+        .entries
+        .iter()
+        .filter(|e| e.pin)
+        .map(|e| (e.id.as_str(), e))
+        .collect();
+    for entry in root.entries.iter_mut() {
+        if let Some(prior_entry) = pinned.get(entry.id.as_str()) {
+            entry.pin = true;
+            entry.version = prior_entry.version.clone();
+        }
+    }
+}
+
+/// Drop root entries whose head ts is older than the `MaxAge` cutoff,
+/// unless the entry is pinned. No-op for `Never` and `KeepLastN` —
+/// `KeepLastN` acts on the hot ledger, not the root view (the root view
+/// already has at most one entry per kino by `pick_head`).
+fn apply_root_entry_gc(
+    root: &mut RootKinograph,
+    events: &[Event],
+    policy: &RootPolicy,
+    now: &str,
+) -> Result<(), CompactError> {
+    let Some(max_age_s) = policy.max_age_seconds() else {
+        return Ok(());
+    };
+    let now_ts = parse_ts(now)?;
+    let cutoff = now_ts - max_age_s;
+    let by_hash: BTreeMap<&str, &Event> = events
+        .iter()
+        .filter(|e| e.is_store_event())
+        .map(|e| (e.hash.as_str(), e))
+        .collect();
+    root.entries.retain(|entry| {
+        if entry.pin {
+            return true;
+        }
+        let Some(head) = by_hash.get(entry.version.as_str()) else {
+            // Head missing from ledger — keep the entry. A downstream
+            // integrity pass (f0rg) will flag this; GC stays conservative.
+            return true;
+        };
+        match parse_ts(&head.ts) {
+            Ok(t) => t >= cutoff,
+            Err(_) => true,
+        }
+    });
+    Ok(())
+}
+
+/// Parse an RFC3339 timestamp into seconds-since-epoch. Errors are
+/// surfaced as `CompactError::Event` via `EventError::Parse`.
+fn parse_ts(s: &str) -> Result<i64, CompactError> {
+    use std::str::FromStr;
+    jiff::Timestamp::from_str(s)
+        .map(|t| t.as_second())
+        .map_err(|e| {
+            CompactError::Event(EventError::Parse(format!(
+                "invalid ts {s:?}: {e}"
+            )))
+        })
+}
+
+/// Prune hot events owned by `root_name` per `policy`.
+///
+/// Ownership: a store event belongs to the root that its kino id routes
+/// to (via the live-assign graph, default inbox). An assign event belongs
+/// to `target_root` even if it is superseded — so old assigns age out
+/// alongside the store events they used to route.
+///
+/// Protections: (1) pinned versions named by root entries never drop, and
+/// neither does the hot event whose hash equals that version. (2) root-kind
+/// events never drop — they form the compact parent chain. (3) store
+/// events whose hash appears in a live-assign's target kino graph: we keep
+/// the pick_head event (the root's current view) implicitly because
+/// entries point at it and the content store still holds the blob; but on
+/// KeepLastN specifically we protect the head event from the N-window by
+/// always including it in the survivor set.
+fn prune_hot_events(
+    kinora_root: &Path,
+    events: &[Event],
+    root_name: &str,
+    declared_roots: &BTreeSet<String>,
+    root: &RootKinograph,
+    policy: &RootPolicy,
+    now: &str,
+) -> Result<(), CompactError> {
+    if matches!(policy, RootPolicy::Never) {
+        return Ok(());
+    }
+
+    // Pinned versions (content hashes) — these store events must survive.
+    let pinned_versions: BTreeSet<&str> = root
+        .entries
+        .iter()
+        .filter(|e| e.pin)
+        .map(|e| e.version.as_str())
+        .collect();
+
+    // Recompute live-assign routing to find each store event's owning root.
+    let live_assigns = collect_live_assigns(events)?;
+
+    // Pre-index: for each kino id routed to this root, the set of its
+    // store events (ordered by ts for KeepLastN).
+    let mut owned_stores_by_id: BTreeMap<String, Vec<&Event>> = BTreeMap::new();
+    let mut owned_assigns: Vec<&Event> = Vec::new();
+    for e in events {
+        if e.event_kind == EVENT_KIND_ASSIGN {
+            if let Ok(a) = AssignEvent::from_event(e)
+                && a.target_root == root_name
+            {
+                owned_assigns.push(e);
+            }
+            continue;
+        }
+        if !e.is_store_event() || e.kind == "root" {
+            continue;
+        }
+        let target = kino_target_root(&e.id, &live_assigns, declared_roots)?;
+        let target_name = target.as_deref().unwrap_or("inbox");
+        if target_name == root_name {
+            owned_stores_by_id.entry(e.id.clone()).or_default().push(e);
+        }
+    }
+
+    let mut drop_hashes: BTreeSet<Hash> = BTreeSet::new();
+
+    match policy {
+        RootPolicy::Never => unreachable!(),
+        RootPolicy::MaxAge(_) => {
+            let Some(max_age_s) = policy.max_age_seconds() else {
+                return Ok(());
+            };
+            let now_ts = parse_ts(now)?;
+            let cutoff = now_ts - max_age_s;
+            // Store events: drop if older than cutoff AND not pinned.
+            for group in owned_stores_by_id.values() {
+                for e in group {
+                    if pinned_versions.contains(e.hash.as_str()) {
+                        continue;
+                    }
+                    let Ok(ts) = parse_ts(&e.ts) else { continue };
+                    if ts < cutoff {
+                        drop_hashes.insert(e.event_hash()?);
+                    }
+                }
+            }
+            // Assigns: age-based only, no pin protection (assigns aren't
+            // pin-addressable — pins name store-event content hashes).
+            for e in &owned_assigns {
+                let Ok(ts) = parse_ts(&e.ts) else { continue };
+                if ts < cutoff {
+                    drop_hashes.insert(e.event_hash()?);
+                }
+            }
+        }
+        RootPolicy::KeepLastN(n) => {
+            // Per kino id: sort store events by ts desc, keep the N newest;
+            // mark the remainder for drop unless they are pinned versions.
+            // Assigns are NOT touched by KeepLastN (policy acts on store
+            // versions only).
+            for (_, mut group) in owned_stores_by_id {
+                group.sort_by(|a, b| b.ts.cmp(&a.ts));
+                for (idx, e) in group.iter().enumerate() {
+                    if idx < *n {
+                        continue;
+                    }
+                    if pinned_versions.contains(e.hash.as_str()) {
+                        continue;
+                    }
+                    drop_hashes.insert(e.event_hash()?);
+                }
+            }
+        }
+    }
+
+    for h in drop_hashes {
+        let path = hot_event_path(kinora_root, &h);
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(CompactError::Io(e)),
+        }
+    }
+    Ok(())
 }
 
 /// One entry in the batch report produced by `compact_all`.
@@ -1595,11 +1846,13 @@ roots {
     #[test]
     fn keep_last_n_pin_on_version_1_survives_plus_three_newest() {
         let (_t, root) = setup();
+        // Start with Never so the first compact materializes every version
+        // without pruning anything — the user can then hand-edit the pin.
         write_config(
             &root,
             r#"repo-url "https://example.com/x.git"
 roots {
-  rfcs { policy "keep-last-3" }
+  rfcs { policy "never" }
 }
 "#,
         );
@@ -1618,7 +1871,16 @@ roots {
         compact_root(&root, "rfcs", params("yj", "2026-04-05T11:00:00Z")).unwrap();
         // Pin the root entry to v1 explicitly. This simulates a hand-edit.
         overwrite_root_with_pin(&root, "rfcs", &chain[0].id, &chain[0].hash, "2026-04-05T11:30:00Z");
-        // Next compact runs the full KeepLastN(3) sweep.
+        // Now switch the policy to keep-last-3 and run again. The pin from
+        // the prior root must propagate and protect v1 from the N-window.
+        write_config(
+            &root,
+            r#"repo-url "https://example.com/x.git"
+roots {
+  rfcs { policy "keep-last-3" }
+}
+"#,
+        );
         compact_root(&root, "rfcs", params("yj", "2026-04-19T10:00:00Z")).unwrap();
         // v1 pinned → survives; v3, v4, v5 are the 3 newest → survive; v2 pruned.
         assert!(hot_event_exists(&root, &chain[0]), "v1 pinned, must survive");
