@@ -730,7 +730,80 @@ mod tests {
     }
 
     #[test]
-    fn worktree_surfaces_as_its_own_group_when_branch_differs() {
+    fn branch_without_kinora_is_skipped_not_aborted() {
+        // One branch has `.kinora/` committed, another doesn't (legitimate
+        // for a branch that existed before kinora was introduced). The
+        // render should skip the second branch via `ExtractError::SubtreeAbsent`
+        // rather than falling back or failing the whole render.
+        let tmp = TempDir::new().unwrap();
+        git_init(tmp.path());
+
+        // Seed a pre-kinora commit on main so the branch `legacy` can
+        // point at it without ever having seen `.kinora/`.
+        std::fs::write(tmp.path().join("README.md"), b"# readme\n").unwrap();
+        git(&["add", "README.md"], tmp.path());
+        git(&["commit", "-m", "pre-kinora"], tmp.path());
+        git(&["branch", "legacy"], tmp.path());
+
+        init(tmp.path(), "https://github.com/edger-dev/kinora").unwrap();
+        let kin = kinora_root(tmp.path());
+        store_kino(&kin, params(b"# alpha\n", "alpha")).unwrap();
+        git(&["add", "-A"], tmp.path());
+        git(&["commit", "-m", "add kinora on main"], tmp.path());
+
+        let cache = TempDir::new().unwrap();
+        let args = RenderRunArgs {
+            cache_dir: Some(cache.path().to_string_lossy().into_owned()),
+        };
+        let report = run_render(tmp.path(), args).unwrap();
+        // `legacy` had no .kinora/ — skipped. Only `main` contributes.
+        assert_eq!(report.source_count, 1, "got {report:?}");
+        assert!(cache.path().join("src/main").is_dir());
+        assert!(!cache.path().join("src/legacy").exists());
+    }
+
+    #[test]
+    fn detached_head_worktree_surfaces_as_its_own_group() {
+        // A linked worktree checked out in detached-HEAD state has no ref
+        // to dedupe against — it should surface under its own `worktree-*`
+        // label.
+        let tmp = TempDir::new().unwrap();
+        git_init(tmp.path());
+        init(tmp.path(), "https://github.com/edger-dev/kinora").unwrap();
+        let kin = kinora_root(tmp.path());
+
+        store_kino(&kin, params(b"# alpha\n", "alpha")).unwrap();
+        git(&["add", "-A"], tmp.path());
+        git(&["commit", "-m", "seed"], tmp.path());
+
+        let wt_parent = TempDir::new().unwrap();
+        let wt_path = wt_parent.path().join("detached");
+        git(
+            &["worktree", "add", "--detach", wt_path.to_str().unwrap(), "HEAD"],
+            tmp.path(),
+        );
+
+        let cache = TempDir::new().unwrap();
+        let args = RenderRunArgs {
+            cache_dir: Some(cache.path().to_string_lossy().into_owned()),
+        };
+        let report = run_render(tmp.path(), args).unwrap();
+        // main (branch) + detached worktree = 2 sources.
+        assert_eq!(report.source_count, 2, "got {report:?}");
+        let dirs: Vec<String> = std::fs::read_dir(cache.path().join("src"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+            .collect();
+        assert!(
+            dirs.iter().any(|f| f.starts_with("worktree-")),
+            "expected a worktree-* group for detached HEAD: {dirs:?}",
+        );
+    }
+
+    #[test]
+    fn worktree_dedupes_against_matching_branch() {
         let tmp = TempDir::new().unwrap();
         git_init(tmp.path());
         init(tmp.path(), "https://github.com/edger-dev/kinora").unwrap();
