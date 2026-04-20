@@ -24,7 +24,6 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -36,8 +35,7 @@ use crate::kinograph::{Kinograph, KinographError};
 use crate::ledger::{Ledger, LedgerError};
 use crate::namespace::ext_for_kind;
 use crate::paths::{
-    config_path, find_blob_path, ledger_dir, root_pointer_path, roots_dir, staged_dir,
-    staged_event_path, store_dir, STAGED_EXT,
+    config_path, find_blob_path, ledger_dir, root_pointer_path, roots_dir, staged_dir, store_dir,
 };
 use crate::root::{RootError, RootKinograph};
 use crate::store::{ContentStore, StoreError};
@@ -237,6 +235,7 @@ pub fn clone_repo(
         }
     }
 
+    let dst_ledger = Ledger::new(dst);
     for event in &events {
         let keep = if event.is_store_event() {
             reachable_blobs.contains(&event.hash)
@@ -246,22 +245,7 @@ pub fn clone_repo(
         if !keep {
             continue;
         }
-        let event_hash = event.event_hash()?;
-        let dst_path = staged_event_path(dst, &event_hash);
-        if dst_path.is_file() {
-            continue;
-        }
-        if let Some(parent) = dst_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let line = event.to_json_line()?;
-        let tmp = dst_path.with_extension(format!("{STAGED_EXT}.tmp"));
-        {
-            let mut f = fs::File::create(&tmp)?;
-            f.write_all(line.as_bytes())?;
-            f.write_all(b"\n")?;
-        }
-        fs::rename(&tmp, &dst_path)?;
+        dst_ledger.write_event(event)?;
     }
 
     Ok(report)
@@ -709,6 +693,23 @@ mod tests {
         let src_bytes = src_resolver.resolve_by_id(&md.id).unwrap().content;
         let dst_bytes = dst_resolver.resolve_by_id(&md.id).unwrap().content;
         assert_eq!(src_bytes, dst_bytes);
+    }
+
+    #[test]
+    fn clone_reports_zero_dropped_when_everything_is_reachable() {
+        // Symmetric counterpart to clone_drops_unreachable_blob — if
+        // every src blob is committed, the report should show zero
+        // dropped.
+        let (_t, src) = setup();
+        store_md(&src, b"a", "a", "2026-04-20T09:00:00Z");
+        store_md(&src, b"b", "b", "2026-04-20T09:00:01Z");
+        commit_all(&src, commit_params("2026-04-20T09:00:02Z")).unwrap();
+
+        let dst_tmp = TempDir::new().unwrap();
+        let dst = dst_tmp.path().join("dst");
+        let report = clone_repo(&src, &dst, clone_params("2026-04-20T09:00:03Z"))
+            .unwrap();
+        assert_eq!(report.blobs_dropped, 0, "nothing should be dropped: {report:?}");
     }
 
     #[test]
