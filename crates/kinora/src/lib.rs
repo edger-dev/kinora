@@ -6,6 +6,7 @@ pub mod commit;
 pub mod commit_archive;
 pub mod config;
 pub mod event;
+pub mod git_state;
 pub mod hash;
 pub mod init;
 pub mod kino;
