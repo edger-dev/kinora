@@ -24,12 +24,13 @@
 //! content bytes. Content migrations (e.g. legacy styx → styxl) still
 //! go through `kinora::reformat`.
 
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::clone::{CloneError, CloneReport};
-use crate::commit::CommitError;
-use crate::paths::KINORA_DIR;
+use crate::clone::{clone_repo, CloneError, CloneParams, CloneReport};
+use crate::commit::{commit_all, CommitError, CommitParams, CommitResult};
+use crate::paths::{kinora_root, KINORA_DIR};
 
 pub const TMP_SUFFIX: &str = ".repack-tmp";
 pub const OLD_SUFFIX: &str = ".repack-old";
@@ -66,12 +67,22 @@ pub struct RepackParams {
 }
 
 /// Per-root commit outcome that survived the repack. Mirrors the subset
-/// of `CommitResult` callers typically want for human output.
+/// of [`CommitResult`] callers typically want for human output.
 #[derive(Debug, Clone)]
 pub struct RepackCommitEntry {
     pub root_name: String,
     pub new_version: Option<String>,
     pub prior_version: Option<String>,
+}
+
+impl RepackCommitEntry {
+    fn from_result(r: &CommitResult) -> Self {
+        Self {
+            root_name: r.root_name.clone(),
+            new_version: r.new_version.as_ref().map(|h| h.as_hex().to_owned()),
+            prior_version: r.prior_version.as_ref().map(|h| h.as_hex().to_owned()),
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -83,26 +94,85 @@ pub struct RepackReport {
 /// Run repack against the repo rooted at `repo_root` (the directory
 /// *containing* `.kinora/`, not `.kinora/` itself).
 pub fn repack_repo(
-    _repo_root: &Path,
-    _params: RepackParams,
+    repo_root: &Path,
+    params: RepackParams,
 ) -> Result<RepackReport, RepackError> {
-    todo!("impl pending")
+    let kin_dir = kinora_root(repo_root);
+    let tmp_dir = sibling(repo_root, TMP_SUFFIX);
+    let old_dir = sibling(repo_root, OLD_SUFFIX);
+
+    if tmp_dir.exists() {
+        return Err(RepackError::TempExists { path: tmp_dir });
+    }
+    if old_dir.exists() {
+        return Err(RepackError::OldExists { path: old_dir });
+    }
+
+    let commit_params = CommitParams {
+        author: params.author.clone(),
+        provenance: params.provenance.clone(),
+        ts: params.ts.clone(),
+    };
+    let commit_results = commit_all(&kin_dir, commit_params)?;
+    let mut commits = Vec::with_capacity(commit_results.len());
+    for (root_name, res) in commit_results {
+        match res {
+            Ok(r) => commits.push(RepackCommitEntry::from_result(&r)),
+            Err(err) => {
+                return Err(RepackError::CommitRootFailed {
+                    root_name,
+                    err: Box::new(err),
+                });
+            }
+        }
+    }
+
+    let clone_params = CloneParams {
+        author: params.author,
+        provenance: params.provenance,
+        ts: params.ts,
+    };
+    let clone_report = clone_repo(&kin_dir, &tmp_dir, clone_params)?;
+
+    match swap(&kin_dir, &tmp_dir, &old_dir) {
+        Ok(()) => {}
+        Err(e) => {
+            // Swap failed — `swap` has already restored `.kinora/` so the
+            // repo is intact. Best-effort clean the leftover tmp.
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return Err(RepackError::SwapFailed(e));
+        }
+    }
+
+    // Remove the old dir (best-effort — on failure we leak but don't
+    // corrupt; the next repack preflight will complain which is
+    // actionable).
+    fs::remove_dir_all(&old_dir)?;
+
+    Ok(RepackReport { commits, clone: clone_report })
 }
 
-#[allow(dead_code)]
-pub(crate) fn sibling(repo_root: &Path, suffix: &str) -> PathBuf {
+/// The two-rename critical section. On rename-2 failure, rolls back
+/// rename-1 so the caller sees an intact `.kinora/`.
+fn swap(kin: &Path, tmp: &Path, old: &Path) -> io::Result<()> {
+    fs::rename(kin, old)?;
+    if let Err(e) = fs::rename(tmp, kin) {
+        let _ = fs::rename(old, kin);
+        return Err(e);
+    }
+    Ok(())
+}
+
+fn sibling(repo_root: &Path, suffix: &str) -> PathBuf {
     repo_root.join(format!("{KINORA_DIR}{suffix}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commit::{commit_all, CommitParams};
     use crate::init::init;
     use crate::kino::{store_kino, StoreKinoParams};
-    use crate::paths::kinora_root;
     use std::collections::BTreeMap;
-    use std::fs;
     use tempfile::TempDir;
 
     fn setup() -> (TempDir, PathBuf) {
