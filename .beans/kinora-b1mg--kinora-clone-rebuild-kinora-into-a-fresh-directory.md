@@ -1,11 +1,11 @@
 ---
 # kinora-b1mg
 title: 'kinora clone: rebuild .kinora/ into a fresh directory'
-status: todo
+status: in-progress
 type: feature
 priority: normal
 created_at: 2026-04-19T14:51:05Z
-updated_at: 2026-04-19T19:17:28Z
+updated_at: 2026-04-20T13:31:33Z
 blocked_by:
     - kinora-jezf
     - kinora-q6bo
@@ -127,7 +127,7 @@ Follow the `kinora reformat` / `kinora commit` pattern:
 
 ### Todos
 
-- [ ] Phase A: library clone module — tests first (empty repo, one-kino repo, reachable walk, hash verification, staged-non-empty error)
+- [x] Phase A: library clone module — tests first (empty repo, one-kino repo, reachable walk, hash verification, staged-non-empty error)
 - [ ] Phase A: library clone module — impl
 - [ ] Phase B: CLI `kinora clone` — tests + impl
 - [ ] Phase C: review + fixes
@@ -137,3 +137,14 @@ Follow the `kinora reformat` / `kinora commit` pattern:
 Plan is captured above. Moved back to `todo` (not `draft` — spec is clear, no open design questions).
 
 Rationale for handoff: this task is a new library module (`kinora::clone`) plus a new CLI command, with a reachability walk, hash verification flow, root pointer + ledger event copy, and acceptance criteria around legacy-filename rewriting. Scope is 3 phases, ~5–8 commits. Better to start it in a fresh session than spill across a compacted one where context has already been heavily used on the preceding kinora-tx3e work.
+
+## Implementation note (2026-04-20 resume)
+
+Pragmatic deviation from bean step 1 ("staged must be empty"): kinora-q6bo landed the archive machinery but deferred staged-cleanup itself to kinora-bayr. So pre-bayr every repo has a populated staged dir, and enforcing staged-empty would make clone impossible today.
+
+Workaround:
+- Drop staged-empty check for now
+- Filter events during copy: keep store events whose `hash` is in reachable_blobs; keep all non-store events (assigns) verbatim
+- Re-instate the staged-empty check once bayr lands; at that point the dst staged-empty acceptance criterion becomes naturally satisfied
+
+Everything else in the bean spec stands.
