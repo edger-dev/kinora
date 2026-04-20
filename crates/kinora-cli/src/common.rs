@@ -2,6 +2,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use kinora::assign::AssignError;
+use kinora::clone::CloneError;
 use kinora::commit::CommitError;
 use kinora::config::ConfigError;
 use kinora::kino::StoreKinoError;
@@ -30,6 +31,8 @@ pub enum CliError {
     CacheHomeUnresolved,
     #[error("--root must be a non-empty root name")]
     EmptyRoot,
+    #[error("`kinora clone` takes src/dst directly — `-C`/`--repo-root` is not supported here")]
+    CloneWithRepoRoot,
     #[error(transparent)]
     Config(#[from] ConfigError),
     #[error(transparent)]
@@ -52,6 +55,8 @@ pub enum CliError {
     Assign(#[from] AssignError),
     #[error(transparent)]
     Reformat(#[from] ReformatError),
+    #[error(transparent)]
+    Clone(#[from] CloneError),
 }
 
 /// Walk up from `start` looking for a directory that contains `.kinora/`.

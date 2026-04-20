@@ -3,6 +3,7 @@ use std::process::ExitCode;
 
 use assign::{format_assign_summary, run_assign, AssignRunArgs};
 use cli::{Cli, Command};
+use clone::{format_clone_summary, run_clone, CloneRunArgs};
 use commit::{render_commit_entry, run_commit, CommitRunArgs};
 use fastrace::collector::{Config as FastraceConfig, ConsoleReporter, SpanContext};
 use fastrace::Span;
@@ -21,6 +22,7 @@ use store::{format_store_summary, run_store, StoreRunArgs};
 
 mod assign;
 mod cli;
+mod clone;
 mod common;
 mod commit;
 mod reformat;
@@ -85,6 +87,24 @@ fn run() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    // Clone takes both paths verbatim and doesn't operate on a repo root,
+    // so it bypasses the `-C` / repo-root resolution (which would error
+    // when invoked outside a kinora repo). `-C` combined with clone is
+    // rejected up front so callers notice the flag was meaningless.
+    if let Command::Clone { src, dst, author, provenance } = cli.command {
+        if cli.repo_root.is_some() {
+            return report_err("clone", common::CliError::CloneWithRepoRoot);
+        }
+        let args = CloneRunArgs { src, dst, author, provenance };
+        return match run_clone(&cwd, args) {
+            Ok(report) => {
+                println!("{}", format_clone_summary(&report));
+                ExitCode::SUCCESS
+            }
+            Err(e) => report_err("clone", e),
+        };
+    }
 
     // Resolve the effective repo root once, honoring the global `-C` /
     // `--repo-root` flag. Each `run_*` still calls `find_repo_root` on
@@ -221,6 +241,7 @@ fn run() -> ExitCode {
                 Err(e) => report_err("resolve", e),
             }
         }
+        Command::Clone { .. } => unreachable!("Clone is dispatched before repo-root resolution"),
     }
 }
 

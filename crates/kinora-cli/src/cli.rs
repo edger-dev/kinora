@@ -155,4 +155,29 @@ pub enum Command {
         #[facet(args::named, default)]
         provenance: Option<String>,
     },
+
+    /// Rebuild a `.kinora/` directory into a fresh target. Copies only
+    /// reachable blobs from `<src>` into `<dst>` through the current store
+    /// API, rewriting legacy extensionless filenames into the canonical
+    /// `<hash>.<ext>` form and dropping unreachable blobs. Hash-preserving:
+    /// content bytes are never rewritten (use `kinora reformat` for that).
+    /// Both paths are taken verbatim as `.kinora/` directories — no
+    /// walk-up.
+    Clone {
+        /// Source `.kinora/` directory.
+        #[facet(args::positional)]
+        src: String,
+
+        /// Destination path. Must be empty or non-existent.
+        #[facet(args::positional)]
+        dst: String,
+
+        /// Override author. Defaults to `clone`.
+        #[facet(args::named, default)]
+        author: Option<String>,
+
+        /// Provenance of this clone run. Defaults to `clone`.
+        #[facet(args::named, default)]
+        provenance: Option<String>,
+    },
 }
