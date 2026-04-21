@@ -2369,9 +2369,14 @@ roots {
     }
 
     // -- Staged-ledger prune: MaxAge ----------------------------------------
+    //
+    // After kinora-wcpp, MaxAge retention no longer runs in staging — it
+    // runs on the kinograph via apply_root_entry_gc reading entry.head_ts.
+    // Both old and fresh owned events are drained after archive (same as
+    // Never); the old *entry* is dropped from the kinograph by GC.
 
     #[test]
-    fn max_age_staged_ledger_prunes_events_older_than_policy() {
+    fn max_age_drains_both_old_and_fresh_owned_events() {
         let (_t, root) = setup();
         write_config(
             &root,
@@ -2387,15 +2392,9 @@ roots {
         write_assign_for(&root, &fresh.id, "rfcs", vec![], "2026-04-18T10:00:01Z");
 
         commit_root(&root, "rfcs", params("yj", "2026-04-19T10:00:00Z")).unwrap();
-        // old's store event must have been pruned; fresh's retained.
-        assert!(
-            !staged_event_exists(&root, &old),
-            "stale staged event should be gone"
-        );
-        assert!(
-            staged_event_exists(&root, &fresh),
-            "fresh staged event should survive"
-        );
+        // Both drained — retention moves to the kinograph.
+        assert!(!staged_event_exists(&root, &old), "old store event drained");
+        assert!(!staged_event_exists(&root, &fresh), "fresh store event drained");
     }
 
     // -- Staged-ledger prune: KeepLastN -------------------------------------
@@ -2485,17 +2484,20 @@ roots {
     // -- Staged-ledger prune baseline: fresh events untouched ----------------
 
     #[test]
-    fn fresh_staged_events_untouched_by_policy() {
+    fn fresh_staged_events_untouched_by_keep_last_n_policy() {
+        // KeepLastN retention still runs on staging (its "N versions per
+        // kino" semantic is load-bearing on the staged stream). Fresh
+        // events within the N-window must survive commit. After wcpp,
+        // MaxAge no longer has this invariant — covered by the drain tests.
         let (_t, root) = setup();
         write_config(
             &root,
             r#"repo-url "https://example.com/x.git"
 roots {
-  rfcs { policy "7d" }
+  rfcs { policy "keep-last-10" }
 }
 "#,
         );
-        // Two events, both under 7 days old.
         let a = store_md(&root, b"a", "a", "2026-04-18T10:00:00Z");
         let b = store_md(&root, b"b", "b", "2026-04-19T09:00:00Z");
         write_assign_for(&root, &a.id, "rfcs", vec![], "2026-04-18T10:00:01Z");
@@ -2503,10 +2505,9 @@ roots {
         let count_before = staged_event_count(&root);
         commit_root(&root, "rfcs", params("yj", "2026-04-19T10:00:00Z")).unwrap();
         let count_after = staged_event_count(&root);
-        // Commit adds a root event (+1) but must not drop the two user + two assign events.
         assert!(
             count_after >= count_before,
-            "fresh events must survive: before={count_before}, after={count_after}"
+            "fresh events must survive under KeepLastN: before={count_before}, after={count_after}"
         );
         assert!(staged_event_exists(&root, &a));
         assert!(staged_event_exists(&root, &b));
@@ -2559,7 +2560,7 @@ roots {
     // -- MaxAge prunes old assigns alongside old store events -----------
 
     #[test]
-    fn max_age_prunes_old_assign_events_too() {
+    fn max_age_drains_both_old_and_fresh_assign_events() {
         let (_t, root) = setup();
         write_config(
             &root,
@@ -2569,10 +2570,6 @@ roots {
 }
 "#,
         );
-        // Old store + old assign, both 14 days stale; fresh store + fresh
-        // assign both under 1 day. The old assign still needs to be on
-        // disk at commit time (else the old kino wouldn't route to rfcs),
-        // so we age both stores into the past but run commit at `now`.
         let old = store_md(&root, b"old", "old", "2026-04-05T10:00:00Z");
         let fresh = store_md(&root, b"fresh", "fresh", "2026-04-18T10:00:00Z");
         let old_assign_hash =
@@ -2580,8 +2577,6 @@ roots {
         let fresh_assign_hash =
             write_assign_for(&root, &fresh.id, "rfcs", vec![], "2026-04-18T10:00:01Z");
 
-        // Find the full assign events so we can ask staged_event_exists about
-        // their JSON-line hashes (mirrors what the prune path keys on).
         let events = Ledger::new(&root).read_all_events().unwrap();
         let old_assign = events
             .iter()
@@ -2596,14 +2591,8 @@ roots {
 
         commit_root(&root, "rfcs", params("yj", "2026-04-19T10:00:00Z")).unwrap();
 
-        assert!(
-            !staged_event_exists(&root, &old_assign),
-            "stale assign event must be pruned"
-        );
-        assert!(
-            staged_event_exists(&root, &fresh_assign),
-            "fresh assign event must survive"
-        );
+        assert!(!staged_event_exists(&root, &old_assign), "old assign drained");
+        assert!(!staged_event_exists(&root, &fresh_assign), "fresh assign drained");
     }
 
     // ------------------------------------------------------------------
@@ -3640,6 +3629,140 @@ roots {
             kg.entries.len(),
             1,
             "entry with unparseable head_ts must be kept, not dropped",
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // wcpp: MaxAge drain + prior_root merge
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn max_age_drains_archived_events_from_staging_after_commit() {
+        // Under MaxAge, owned store + assign events must be archived and
+        // then drained from staging — regardless of age. Retention is now
+        // the kinograph's job (via apply_root_entry_gc reading head_ts),
+        // not staging's.
+        let (_t, root) = setup();
+        write_config(
+            &root,
+            r#"repo-url "https://example.com/x.git"
+roots {
+  rfcs { policy "30d" }
+}
+"#,
+        );
+        // Fresh (1-day-old) kino — well under the 30d cutoff. Previously
+        // this would stay in staging; under wcpp it should be drained.
+        let k = store_md(&root, b"doc", "doc", "2026-04-18T10:00:00Z");
+        let k_assign_hash =
+            write_assign_for(&root, &k.id, "rfcs", vec![], "2026-04-18T10:00:01Z");
+        let before = Ledger::new(&root).read_all_events().unwrap();
+        let k_assign = before
+            .iter()
+            .find(|e| e.event_hash().unwrap() == k_assign_hash)
+            .cloned()
+            .unwrap();
+        assert!(staged_event_exists(&root, &k));
+        assert!(staged_event_exists(&root, &k_assign));
+
+        commit_root(&root, "rfcs", params("yj", "2026-04-19T10:00:00Z")).unwrap();
+
+        assert!(
+            !staged_event_exists(&root, &k),
+            "store event must be drained after MaxAge archive",
+        );
+        assert!(
+            !staged_event_exists(&root, &k_assign),
+            "assign event must be drained after MaxAge archive",
+        );
+        // Archive store event is still in staging for commits to consume.
+        let events_after = Ledger::new(&root).read_all_events().unwrap();
+        assert!(
+            events_after
+                .iter()
+                .any(|e| e.is_store_event() && e.kind == ARCHIVE_CONTENT_KIND),
+            "archive store event must still be in staging for commits to consume",
+        );
+        // And the entry is in rfcs's kinograph.
+        let pointer = read_root_pointer(&root, "rfcs").unwrap().unwrap();
+        assert_eq!(root_ids(&root, &pointer), vec![k.id]);
+    }
+
+    #[test]
+    fn max_age_entries_age_out_of_root_kinograph_via_gc_post_drain() {
+        // After MaxAge drains owned events on commit, retention for old
+        // entries must happen via apply_root_entry_gc reading entry.head_ts
+        // — not via staging prune (which no longer fires for MaxAge).
+        let (_t, root) = setup();
+        write_config(
+            &root,
+            r#"repo-url "https://example.com/x.git"
+roots {
+  rfcs { policy "7d" }
+}
+"#,
+        );
+        // 14-day-old kino — will age out. A fresh one so the root has
+        // something to keep around.
+        let old = store_md(&root, b"old", "old", "2026-04-05T10:00:00Z");
+        let fresh = store_md(&root, b"fresh", "fresh", "2026-04-18T10:00:00Z");
+        write_assign_for(&root, &old.id, "rfcs", vec![], "2026-04-05T10:00:01Z");
+        write_assign_for(&root, &fresh.id, "rfcs", vec![], "2026-04-18T10:00:01Z");
+
+        // First commit: both staged, both archive, kinograph has `fresh`
+        // (old entry drops immediately via GC because its head_ts is old).
+        let res = commit_root(&root, "rfcs", params("yj", "2026-04-19T10:00:00Z"))
+            .unwrap();
+        let pointer = res.new_version.unwrap();
+        let ids = root_ids(&root, &pointer);
+        assert_eq!(
+            ids,
+            vec![fresh.id.clone()],
+            "old entry must age out of kinograph on first commit after drain",
+        );
+        // Both store events and both assigns are drained.
+        assert!(!staged_event_exists(&root, &old));
+        assert!(!staged_event_exists(&root, &fresh));
+    }
+
+    #[test]
+    fn max_age_prior_root_merges_entries_across_commits() {
+        // Under MaxAge, once staged events are drained the prior kinograph
+        // is the only record of entries. A subsequent commit with no new
+        // activity must preserve them via the prior_root merge path in
+        // build_root (analogous to the Never behavior under kinora-bayr).
+        let (_t, root) = setup();
+        write_config(
+            &root,
+            r#"repo-url "https://example.com/x.git"
+roots {
+  rfcs { policy "30d" }
+}
+"#,
+        );
+        let k = store_md(&root, b"v1", "doc", "2026-04-18T10:00:00Z");
+        write_assign_for(&root, &k.id, "rfcs", vec![], "2026-04-18T10:00:01Z");
+
+        let first = commit_root(&root, "rfcs", params("yj", "2026-04-19T10:00:00Z"))
+            .unwrap();
+        assert_eq!(
+            root_ids(&root, &first.new_version.clone().unwrap()),
+            vec![k.id.clone()],
+        );
+
+        // No new events — rebuild must see the same state via prior_root
+        // merge (staged events have been drained).
+        let second = commit_root(&root, "rfcs", params("yj", "2026-04-19T11:00:00Z"))
+            .unwrap();
+        assert!(
+            second.new_version.is_none(),
+            "no new events → rebuild must match prior → no-op",
+        );
+        let pointer = read_root_pointer(&root, "rfcs").unwrap().unwrap();
+        assert_eq!(
+            root_ids(&root, &pointer),
+            vec![k.id],
+            "entry must be preserved via prior_root merge after MaxAge drain",
         );
     }
 

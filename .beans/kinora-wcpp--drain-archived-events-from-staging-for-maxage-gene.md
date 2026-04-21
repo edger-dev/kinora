@@ -1,11 +1,11 @@
 ---
 # kinora-wcpp
 title: Drain archived events from staging for MaxAge (generalize bayr)
-status: todo
+status: in-progress
 type: feature
 priority: high
 created_at: 2026-04-21T13:47:30Z
-updated_at: 2026-04-21T13:50:40Z
+updated_at: 2026-04-21T14:05:02Z
 ---
 
 ## Context
