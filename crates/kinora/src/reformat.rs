@@ -581,6 +581,7 @@ mod tests {
             md_hash.as_hex(),
             "markdown",
             BTreeMap::from([("name".into(), "body".into())]),
+            "",
         )];
         let prior_root = seed_legacy_root_pointer(
             &root,

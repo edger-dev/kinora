@@ -32,6 +32,12 @@ pub struct RootEntry {
     pub note: String,
     #[facet(default)]
     pub pin: bool,
+    // RFC3339 ts of the head store event this entry points at. Carried on
+    // the entry so MaxAge GC doesn't depend on the head event still being
+    // in staging. Defaults to empty on legacy kinographs (treated as
+    // "unknown" and conservatively kept by GC).
+    #[facet(default)]
+    pub head_ts: String,
 }
 
 #[derive(Facet, Debug, Clone, PartialEq, Eq)]
@@ -54,11 +60,15 @@ pub enum RootError {
 impl RootEntry {
     /// Build a minimal root entry. Note and pin default to their
     /// empty/false forms; caller sets them explicitly if needed.
+    /// `head_ts` is the RFC3339 timestamp of the head store event this
+    /// entry points at — caller passes empty string for legacy/test cases
+    /// where the ts isn't known.
     pub fn new(
         id: impl Into<String>,
         version: impl Into<String>,
         kind: impl Into<String>,
         metadata: BTreeMap<String, String>,
+        head_ts: impl Into<String>,
     ) -> Self {
         Self {
             id: id.into(),
@@ -67,6 +77,7 @@ impl RootEntry {
             metadata,
             note: String::new(),
             pin: false,
+            head_ts: head_ts.into(),
         }
     }
 
@@ -199,7 +210,7 @@ mod tests {
     }
 
     fn sample_entry(n: u8) -> RootEntry {
-        RootEntry::new(id(n), version_hash(n), "markdown", meta(&format!("name-{n}")))
+        RootEntry::new(id(n), version_hash(n), "markdown", meta(&format!("name-{n}")), "")
     }
 
     #[test]

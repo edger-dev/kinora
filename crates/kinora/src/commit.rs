@@ -439,6 +439,7 @@ pub fn build_root(
             head.hash.clone(),
             head.kind.clone(),
             head.metadata.clone(),
+            String::new(),
         ));
     }
 
@@ -3425,6 +3426,7 @@ roots {
             metadata: BTreeMap::from([("name".into(), "pinned".into())]),
             note: String::new(),
             pin: true,
+            head_ts: String::new(),
         };
         let prior = RootKinograph { entries: vec![pinned.clone()] };
         let built = build_root(&[], "main", &declared, Some(&prior)).unwrap();
@@ -3445,6 +3447,7 @@ roots {
                 "b".repeat(64),
                 "markdown",
                 BTreeMap::new(),
+                "",
             )],
         };
         let reassign = AssignEvent {
@@ -3491,6 +3494,7 @@ roots {
                 "stale-version",
                 "markdown",
                 BTreeMap::new(),
+                "",
             )],
         };
         let built = build_root(
@@ -3504,5 +3508,108 @@ roots {
         // Fresh build wins the version, since the prior entry was not pinned.
         assert_eq!(built.entries[0].version, store.hash);
         let _ = declared;
+    }
+
+    // ------------------------------------------------------------------
+    // 0sgr: head_ts on RootEntry makes GC independent of staging
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn build_root_populates_head_ts_from_head_event() {
+        // build_root must copy the head store event's ts onto RootEntry,
+        // so GC can age entries out without consulting the staged stream.
+        let (_t, root) = setup();
+        let k = store_md(&root, b"hello", "hello", "2026-04-10T12:34:56Z");
+        let declared: BTreeSet<String> = BTreeSet::from(["inbox".to_owned()]);
+        let events = Ledger::new(&root).read_all_events().unwrap();
+        let built = build_root(&events, "inbox", &declared, None).unwrap();
+        let entry = built
+            .entries
+            .iter()
+            .find(|e| e.id == k.id)
+            .expect("entry for stored kino");
+        assert_eq!(
+            entry.head_ts, "2026-04-10T12:34:56Z",
+            "entry.head_ts must match the head store event's ts",
+        );
+    }
+
+    #[test]
+    fn entry_gc_uses_head_ts_on_entry_not_staged_event() {
+        // Construct a root kinograph with a synthetic entry whose
+        // head_ts is old. Run apply_root_entry_gc with an *empty* event
+        // slice — meaning the head event is not in staging. GC must still
+        // age the entry out based on entry.head_ts.
+        let old_id = "a".repeat(64);
+        let old_version = "b".repeat(64);
+        let entry = RootEntry {
+            id: old_id.clone(),
+            version: old_version.clone(),
+            kind: "markdown".into(),
+            metadata: BTreeMap::new(),
+            note: String::new(),
+            pin: false,
+            head_ts: "2026-04-05T10:00:00Z".into(), // 14 days older than `now`
+        };
+        let mut kg = RootKinograph { entries: vec![entry] };
+        let policy = RootPolicy::MaxAge("7d".into());
+        let implicit: BTreeSet<(String, String)> = BTreeSet::new();
+        let refs = ExternalRefs::default();
+
+        apply_root_entry_gc(
+            &mut kg,
+            "rfcs",
+            &[],
+            &policy,
+            "2026-04-19T10:00:00Z",
+            &implicit,
+            &refs,
+        )
+        .unwrap();
+
+        assert!(
+            kg.entries.is_empty(),
+            "GC must drop entry whose head_ts is older than cutoff, even without staged head: {:?}",
+            kg.entries,
+        );
+    }
+
+    #[test]
+    fn entry_gc_keeps_entry_when_head_ts_is_empty() {
+        // Legacy entries loaded from pre-0sgr kinographs have an empty
+        // head_ts. GC must conservatively keep them — matching the
+        // pre-0sgr behavior where an unverifiable head meant "keep".
+        let old_id = "a".repeat(64);
+        let old_version = "b".repeat(64);
+        let entry = RootEntry {
+            id: old_id,
+            version: old_version,
+            kind: "markdown".into(),
+            metadata: BTreeMap::new(),
+            note: String::new(),
+            pin: false,
+            head_ts: String::new(),
+        };
+        let mut kg = RootKinograph { entries: vec![entry] };
+        let policy = RootPolicy::MaxAge("7d".into());
+        let implicit: BTreeSet<(String, String)> = BTreeSet::new();
+        let refs = ExternalRefs::default();
+
+        apply_root_entry_gc(
+            &mut kg,
+            "rfcs",
+            &[],
+            &policy,
+            "2026-04-19T10:00:00Z",
+            &implicit,
+            &refs,
+        )
+        .unwrap();
+
+        assert_eq!(
+            kg.entries.len(),
+            1,
+            "entry with empty head_ts must be kept (legacy fallback)",
+        );
     }
 }

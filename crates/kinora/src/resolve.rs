@@ -905,6 +905,7 @@ mod tests {
             content_hash.as_hex(),
             "markdown",
             BTreeMap::from([("name".into(), "shared".into())]),
+            "",
         );
         // Two root kinographs that each list the same entry.
         let kg = crate::root::RootKinograph { entries: vec![entry] };
