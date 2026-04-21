@@ -311,7 +311,9 @@ fn ingest_root_kinographs(
         Err(e) => return Err(e.into()),
     };
 
-    let existing_id_version: HashSet<(String, String)> = by_id
+    // Mutable so newly-synthesized entries also block re-synthesis when
+    // the next root kinograph happens to list the same (id, version).
+    let mut seen_id_version: HashSet<(String, String)> = by_id
         .iter()
         .flat_map(|(_, events)| events.iter().map(|(_, e)| (e.id.clone(), e.hash.clone())))
         .collect();
@@ -337,7 +339,7 @@ fn ingest_root_kinographs(
         let bytes = store.read(&root_hash)?;
         let kg = RootKinograph::parse(&bytes)?;
         for re in kg.entries {
-            if existing_id_version.contains(&(re.id.clone(), re.version.clone())) {
+            if !seen_id_version.insert((re.id.clone(), re.version.clone())) {
                 continue;
             }
             let lineage = Hash::from_str(&re.version)
@@ -883,6 +885,52 @@ mod tests {
         assert_eq!(resolved.head.hash, v2.event.hash);
         // Only v2 should be a head; v1 survives as a non-head entry.
         assert_eq!(resolved.all_heads.len(), 1);
+    }
+
+    #[test]
+    fn resolver_dedups_entry_appearing_in_two_root_kinographs() {
+        // If the same (id, version) entry shows up in two distinct root
+        // kinographs (e.g. a kino that's simultaneously pinned by two
+        // composition graphs, or more realistically during a transient
+        // cross-root reassign state), the resolver must materialize it
+        // once — not once per appearance.
+        let (_t, root) = setup();
+        let store = ContentStore::new(&root);
+        store.ensure_layout().unwrap();
+
+        // Write a content blob to populate a real hash.
+        let content_hash = store.write("markdown", b"shared").unwrap();
+        let entry = crate::root::RootEntry::new(
+            content_hash.as_hex(),
+            content_hash.as_hex(),
+            "markdown",
+            BTreeMap::from([("name".into(), "shared".into())]),
+        );
+        // Two root kinographs that each list the same entry.
+        let kg = crate::root::RootKinograph { entries: vec![entry] };
+        let kg_bytes = kg.to_styxl().unwrap().into_bytes();
+        let kg_hash = store.write("root", &kg_bytes).unwrap();
+
+        // Seed two pointer files under roots/ pointing at that same
+        // kinograph blob. Both "main" and "alt" advertise the shared entry.
+        let roots = crate::paths::roots_dir(&root);
+        std::fs::create_dir_all(&roots).unwrap();
+        std::fs::write(roots.join("main"), kg_hash.as_hex()).unwrap();
+        std::fs::write(roots.join("alt"), kg_hash.as_hex()).unwrap();
+
+        let resolver = Resolver::load(&root).unwrap();
+        let identity = resolver
+            .identities()
+            .get(content_hash.as_hex())
+            .expect("identity materialized");
+        assert_eq!(
+            identity.events.len(),
+            1,
+            "entry duplicated across kinographs: {:?}",
+            identity.events
+        );
+        assert_eq!(identity.heads.len(), 1);
+        assert_eq!(identity.lineages.len(), 1);
     }
 
     #[test]
