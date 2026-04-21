@@ -1,11 +1,11 @@
 ---
 # kinora-bayr
 title: Prune staged events after archive for 'Never' policy roots
-status: in-progress
+status: completed
 type: feature
 priority: normal
 created_at: 2026-04-19T18:41:54Z
-updated_at: 2026-04-21T01:09:44Z
+updated_at: 2026-04-21T01:35:17Z
 ---
 
 Per-commit archive kinos now capture provenance for non-commits roots, but staged events still accumulate because RootPolicy::Never (commits + any user-declared Never root) leaves prune_staged_events a no-op. Once we're confident in archive correctness, prune owned staged events after a successful archive: for non-commits roots, drop the events that went into the archive; for the commits root, drop archive-assigns it consumed. Needs merge_prior_unpinned_entries logic so build_root still sees kinos that were archived-and-pruned across subsequent commits.
@@ -77,3 +77,52 @@ In `commit_root_with_refs`, split the Never-path prune out of `prune_staged_even
 - **Literal bean wording "drop archive-assigns it consumed" interpreted broadly:** drop ALL owned staged events on the commits root (archive store events + archive-assigns). Rationale: the bean's motivating problem ("staged events still accumulate") isn't fully solved by dropping only assigns. Consistent with non-commits Never behavior.
 - **Missing content blob on prior-root merge:** include the entry regardless. Blob reachability is a separate concern (fsck-like); not the rebuild's job.
 - **Keep `propagate_pins` AND add merge:** complementary paths — pins propagate into entries that exist in the fresh build, merge adds entries that do not.
+
+
+## Summary of Changes
+
+Implemented prune-after-archive for Never-policy roots + prior-root merge.
+
+### Code changes (crates/kinora/src/commit.rs)
+
+1. **`build_root` signature + merge**: now takes `prior_root: Option<&RootKinograph>`. When provided, merges in entries from the prior root whose id is missing from the fresh build AND has no live-assign reassigning the kino to a different root. Rationale: Never-policy prune drops the store events, so a rebuild without merge would lose every prior entry. The live-reassign guard prevents resurrecting moved kinos.
+2. **`merge_source` gating**: in `commit_root_with_refs`, the prior_root is only fed into `build_root` when the policy is Never. MaxAge/KeepLastN keep store events in staging until they age out, so stateless rebuild stays authoritative — merging under those policies would resurrect naturally-superseded entries.
+3. **`maybe_archive_owned_events` return type**: now `Option<(String, Vec<Hash>)>` — caller gets both the archive kino id and the hashes of the owned events that went into it.
+4. **`drop_staged_events` helper**: new; removes named events from `.kinora/staged/`, tolerates NotFound for crash-recovery replay.
+5. **Never-prune wiring**: for non-commits roots, if Never and archive happened, drop the archived hashes. For the commits root, if Never and new_version, compute owned staged events (archive stores + archive-assigns) and drop them — prevents both ledger leak and a subtle inbox-routing trap where an orphaned archive store would default-route to inbox.
+
+### Tests added (7)
+
+- `never_policy_drains_owned_staged_events_after_archive` — non-commits end-to-end
+- `commits_root_drains_owned_staged_events_after_commit_all` — commits end-to-end
+- `never_policy_rebuild_preserves_prior_entries_after_prune` — merge works with no new activity
+- `never_policy_reassign_removes_entry_on_next_rebuild` — merge respects live reassign
+- `build_root_prior_merge_preserves_pinned_entry_with_no_staged_events` — unit
+- `build_root_prior_merge_respects_live_reassign` — unit
+- `build_root_prior_merge_does_not_duplicate_entry_already_in_fresh` — unit
+
+### Tests adapted (8)
+
+Tests that used `policy "never"` as a no-op-prune placeholder for orthogonal concerns were switched to `keep-last-10`:
+- `cross_root_removal_kino_moves_from_main_to_rfcs`
+- `pin_in_root_a_is_dropped_when_kino_is_reassigned_to_root_b`
+- `keep_last_n_pin_on_version_1_survives_plus_three_newest`
+- `clone_preserves_assign_events_in_staged`
+- render tests' `declare_main_root` helper
+
+Archive-counting tests were reworked to inspect the commits kinograph (durable across prune) rather than staging:
+- `commits_root_does_not_archive_itself`
+- `commits_kinograph_contains_archive_after_commit_all`
+- `successive_commits_with_new_activity_stack_distinct_archives`
+- `archive_creation_is_idempotent_across_repeated_commits`
+
+### Known gap → follow-up (kinora-bwo8)
+
+Under kinora-bayr, Never roots prune staged store events. The Resolver today only walks staged events, so render/resolve no longer find kinos committed to a Never root. Content blobs live in the content store and root kinographs carry the metadata needed to rebuild Identities — Resolver::load should be extended to ingest root kinographs. Filed as `kinora-bwo8` (high priority, blocked-by kinora-bayr).
+
+### Acceptance criteria
+
+- All 498 workspace tests pass
+- Zero compiler warnings
+- Code review (subagent) returned clean — no fixes needed
+- 3 commits: tests+stub (a4a21d4), implementation (46f16c4), this bean update
