@@ -198,7 +198,13 @@ pub fn reformat_repo(
     // drained heads. For entries already in staging we keep the staged
     // event untouched — the staged one is the newer head (reformat staged
     // a new version, or the user did).
-    let mut to_visit: Vec<String> = Vec::new();
+    //
+    // `to_visit` carries `(id, Option<version_hint>)` — the hint is the
+    // root entry's `version` for top-level entries, or a composition
+    // entry's `pin` for nested entries. Nested hints let us resolve a
+    // drained inner kinograph that is NOT itself a root entry by reading
+    // its content via the pin (see the synthesize-from-hint block below).
+    let mut to_visit: Vec<(String, Option<String>)> = Vec::new();
     for root_name in config.roots.keys() {
         let Some(hash) = read_root_pointer(kinora_root, root_name)? else {
             continue;
@@ -207,7 +213,7 @@ pub fn reformat_repo(
         let root_kg = RootKinograph::parse(&content)?;
         for entry in &root_kg.entries {
             if entry.kind == "kinograph" {
-                to_visit.push(entry.id.clone());
+                to_visit.push((entry.id.clone(), Some(entry.version.clone())));
             }
             if !events_by_id.contains_key(&entry.id) {
                 let synth = Event::new_store(
@@ -226,9 +232,36 @@ pub fn reformat_repo(
     }
 
     let mut visited: HashSet<String> = HashSet::new();
-    while let Some(id) = to_visit.pop() {
+    while let Some((id, hint)) = to_visit.pop() {
         if !visited.insert(id.clone()) {
             continue;
+        }
+        // Nested-pin fallback: if the id isn't in `events_by_id` (drained
+        // + not a root entry), try to synthesize from the pin/version
+        // hint. Only kinograph-shaped content is useful here — opaque
+        // blobs are left alone.
+        if !events_by_id.contains_key(&id)
+            && let Some(hint_hex) = &hint
+        {
+            let hint_hash = Hash::from_str(hint_hex).map_err(|err| ReformatError::InvalidHash {
+                value: hint_hex.clone(),
+                err,
+            })?;
+            if let Ok(content) = store.read(&hint_hash)
+                && Kinograph::parse(&content).is_ok()
+            {
+                let synth = Event::new_store(
+                    "kinograph".into(),
+                    id.clone(),
+                    hint_hex.clone(),
+                    vec![],
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    BTreeMap::new(),
+                );
+                events_by_id.insert(id.clone(), vec![synth]);
+            }
         }
         let Some(group) = events_by_id.get(&id) else {
             continue;
@@ -280,16 +313,16 @@ pub fn reformat_repo(
         });
 
         // Recurse into composition entries so nested kinographs also get
-        // reformatted in the same pass. When a nested entry's store
-        // event is neither staged nor surfaced by any root kinograph
-        // (archived-only, nested-only), `pick_head` on the next loop
-        // iteration will find nothing in `events_by_id` and silently
-        // skip. That's a pre-existing gap — reformat is best-effort on
-        // post-archive graphs, and the next commit will pick up any
-        // unreformatted bytes on a later pass.
+        // reformatted in the same pass. The composition `pin` (when set)
+        // is carried as the version hint so the nested-pin fallback at
+        // the top of the loop can resolve a drained inner kinograph
+        // whose store event is gone from staging AND whose id isn't
+        // surfaced by any root kinograph. Unpinned composition entries
+        // whose store event is also drained still fall through the
+        // silent-skip; nothing to reformat without a version.
         for entry in &kg.entries {
             if !visited.contains(&entry.id) {
-                to_visit.push(entry.id.clone());
+                to_visit.push((entry.id.clone(), entry.pin_opt().map(ToOwned::to_owned)));
             }
         }
     }
