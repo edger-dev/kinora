@@ -5,7 +5,7 @@ status: in-progress
 type: feature
 priority: high
 created_at: 2026-04-21T13:50:34Z
-updated_at: 2026-04-21T13:56:05Z
+updated_at: 2026-04-21T13:58:21Z
 blocking:
     - kinora-wcpp
 ---
@@ -32,12 +32,12 @@ retention semantics from staging, unblocking wcpp.
 
 - [x] Add `head_ts: String` field on `RootEntry` with `#[facet(default)]` for
   backward-compatible kinograph parsing (older blobs parse with empty ts)
-- [ ] `build_root` populates `head_ts` from the picked head store event
+- [x] `build_root` populates `head_ts` from the picked head store event
 - [x] `RootEntry::new` takes `head_ts` as a constructor arg (caller-updated)
-- [ ] `apply_root_entry_gc` reads `entry.head_ts` instead of looking up events
-- [ ] Empty `head_ts` (legacy entry): keep the entry (matches current
+- [x] `apply_root_entry_gc` reads `entry.head_ts` instead of looking up events
+- [x] Empty `head_ts` (legacy entry): keep the entry (matches current
   conservative fallback)
-- [ ] `propagate_pins` and `prior_root` merge: entries are copied whole,
+- [x] `propagate_pins` and `prior_root` merge: entries are copied whole,
   `head_ts` propagates naturally — no change needed
 
 ## Out of Scope
@@ -49,12 +49,12 @@ retention semantics from staging, unblocking wcpp.
 ## Acceptance Criteria
 
 - [ ] Tests added and passing:
-  - [ ] `build_root_populates_head_ts_from_head_event`
-  - [ ] `entry_gc_uses_head_ts_on_entry_not_staged_event` — simulated by
+  - [x] `build_root_populates_head_ts_from_head_event`
+  - [x] `entry_gc_uses_head_ts_on_entry_not_staged_event` — simulated by
     building a root with known head_ts, then running GC with empty events
-  - [ ] `entry_gc_keeps_entry_when_head_ts_is_empty` — legacy path
-  - [ ] Existing MaxAge/KeepLastN/Never tests still pass
-- [ ] Zero compiler warnings
+  - [x] `entry_gc_keeps_entry_when_head_ts_is_empty` — legacy path
+  - [x] Existing MaxAge/KeepLastN/Never tests still pass
+- [x] Zero compiler warnings
 - [ ] `kinora commit` behavior unchanged end-to-end (no observable diff
   without wcpp)
 - [ ] Bean todo items all checked off

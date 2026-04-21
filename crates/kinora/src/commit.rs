@@ -439,7 +439,7 @@ pub fn build_root(
             head.hash.clone(),
             head.kind.clone(),
             head.metadata.clone(),
-            String::new(),
+            head.ts.clone(),
         ));
     }
 
@@ -662,7 +662,6 @@ fn commit_root_with_refs(
     let retained_by_cross_root = apply_root_entry_gc(
         &mut root,
         root_name,
-        events,
         &policy,
         &params.ts,
         &implicit_pinned,
@@ -992,7 +991,6 @@ fn propagate_pins(root: &mut RootKinograph, prior: Option<&RootKinograph>) {
 fn apply_root_entry_gc(
     root: &mut RootKinograph,
     root_name: &str,
-    events: &[Event],
     policy: &RootPolicy,
     now: &str,
     implicit_pinned: &BTreeSet<(String, String)>,
@@ -1004,23 +1002,18 @@ fn apply_root_entry_gc(
     };
     let now_ts = parse_ts(now)?;
     let cutoff = now_ts - max_age_s;
-    let by_hash: BTreeMap<&str, &Event> = events
-        .iter()
-        .filter(|e| e.is_store_event())
-        .map(|e| (e.hash.as_str(), e))
-        .collect();
     let mut implicit_hits: Vec<(String, String)> = Vec::new();
     root.entries.retain(|entry| {
         if entry.pin {
             return true;
         }
-        let Some(head) = by_hash.get(entry.version.as_str()) else {
-            // Head missing from ledger — keep the entry. The staged ledger
-            // may have been externally trimmed; stay conservative rather
-            // than evict on unverifiable state.
+        if entry.head_ts.is_empty() {
+            // Legacy entry (pre-0sgr kinograph) — no ts signal to compare
+            // against. Stay conservative and keep rather than evict on
+            // unverifiable state.
             return true;
-        };
-        let old = match parse_ts(&head.ts) {
+        }
+        let old = match parse_ts(&entry.head_ts) {
             Ok(t) => t < cutoff,
             Err(e) => {
                 log::warn!(
@@ -1028,9 +1021,9 @@ fn apply_root_entry_gc(
                     root = root_name,
                     kino_id = entry.id.as_str(),
                     version = entry.version.as_str(),
-                    ts = head.ts.as_str(),
+                    ts = entry.head_ts.as_str(),
                     error:% = e;
-                    "unparseable head ts; keeping entry",
+                    "unparseable head_ts on entry; keeping entry",
                 );
                 false
             }
@@ -3559,7 +3552,6 @@ roots {
         apply_root_entry_gc(
             &mut kg,
             "rfcs",
-            &[],
             &policy,
             "2026-04-19T10:00:00Z",
             &implicit,
@@ -3598,7 +3590,6 @@ roots {
         apply_root_entry_gc(
             &mut kg,
             "rfcs",
-            &[],
             &policy,
             "2026-04-19T10:00:00Z",
             &implicit,
