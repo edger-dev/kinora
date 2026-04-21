@@ -3929,4 +3929,62 @@ roots {
         let dropped = drain_archived_orphans(&root).unwrap();
         assert_eq!(dropped, 0, "no commits pointer → nothing to inspect");
     }
+
+    #[test]
+    fn drain_archived_orphans_tolerates_missing_archive_blob() {
+        let (_t, root) = setup();
+        let e = store_md(&root, b"reaped", "reaped", "2026-04-20T10:00:00Z");
+        commit_all(&root, params("yj", "2026-04-20T10:00:01Z")).unwrap();
+
+        // Simulate an archive blob reaped by unrelated cleanup: find the
+        // archive entry in the commits kinograph and delete its file.
+        let commits_ptr = read_root_pointer(&root, COMMITS_ROOT).unwrap().unwrap();
+        let store = ContentStore::new(&root);
+        let commits_kg = RootKinograph::parse(&store.read(&commits_ptr).unwrap()).unwrap();
+        let archive_entry = commits_kg
+            .entries
+            .iter()
+            .find(|e| e.kind == ARCHIVE_CONTENT_KIND)
+            .expect("archive entry present");
+        let archive_hash = Hash::from_str(&archive_entry.id).unwrap();
+        let archive_path = crate::paths::find_blob_path(&root, &archive_hash)
+            .expect("archive blob on disk");
+        fs::remove_file(&archive_path).unwrap();
+
+        // Replay the orphan into staging; with the archive blob gone,
+        // drain must return Ok(0) without surfacing an IO error.
+        Ledger::new(&root).write_event(&e).unwrap();
+        let dropped = drain_archived_orphans(&root).unwrap();
+        assert_eq!(dropped, 0, "missing archive blob must be tolerated, not fail");
+        assert!(
+            staged_event_exists(&root, &e),
+            "orphan stays put when its archive is unverifiable",
+        );
+    }
+
+    #[test]
+    fn drain_archived_orphans_spans_multiple_archive_entries() {
+        let (_t, root) = setup();
+        // Two separate commits produce two distinct archive kinos in the
+        // commits root kinograph — the drain must iterate all of them.
+        let a = store_md(&root, b"alpha", "alpha", "2026-04-20T10:00:00Z");
+        commit_all(&root, params("yj", "2026-04-20T10:00:01Z")).unwrap();
+        let b = store_md(&root, b"bravo", "bravo", "2026-04-20T11:00:00Z");
+        commit_all(&root, params("yj", "2026-04-20T11:00:01Z")).unwrap();
+
+        // Replay both events — they map to different archive blobs.
+        let ledger = Ledger::new(&root);
+        ledger.write_event(&a).unwrap();
+        ledger.write_event(&b).unwrap();
+        assert!(staged_event_exists(&root, &a));
+        assert!(staged_event_exists(&root, &b));
+
+        let dropped = drain_archived_orphans(&root).unwrap();
+        assert_eq!(
+            dropped, 2,
+            "drain must accumulate across every archive entry, not just the first",
+        );
+        assert!(!staged_event_exists(&root, &a));
+        assert!(!staged_event_exists(&root, &b));
+    }
 }
