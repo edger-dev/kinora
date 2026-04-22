@@ -1,11 +1,11 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use crate::event::{Event, EventError};
-use crate::hash::{Hash, SHORTHASH_LEN};
-use crate::paths::{head_path, staged_dir, staged_event_path, ledger_dir, ledger_file_path, STAGED_EXT};
+use crate::hash::Hash;
+use crate::paths::{staged_dir, staged_event_path, STAGED_EXT};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LedgerError {
@@ -13,12 +13,6 @@ pub enum LedgerError {
     Io(#[from] io::Error),
     #[error("ledger event error: {0}")]
     Event(#[from] EventError),
-    #[error("no HEAD: call mint_and_append for the first event")]
-    NoHead,
-    #[error("lineage file `{shorthash}.jsonl` already exists; refusing to clobber append-only file")]
-    LineageAlreadyExists { shorthash: String },
-    #[error("HEAD points to lineage `{shorthash}.jsonl` but file is missing")]
-    LineageMissing { shorthash: String },
 }
 
 pub struct Ledger {
@@ -35,72 +29,8 @@ impl Ledger {
     }
 
     pub fn ensure_layout(&self) -> Result<(), LedgerError> {
-        fs::create_dir_all(ledger_dir(&self.kinora_root))?;
         fs::create_dir_all(staged_dir(&self.kinora_root))?;
         Ok(())
-    }
-
-    /// Read the current lineage shorthash from `.kinora/HEAD`, if any.
-    pub fn current_lineage(&self) -> Result<Option<String>, LedgerError> {
-        let path = head_path(&self.kinora_root);
-        match fs::read_to_string(&path) {
-            Ok(s) => Ok(Some(s.trim().to_owned())),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(LedgerError::Io(e)),
-        }
-    }
-
-    /// Atomically write `.kinora/HEAD` with the given lineage shorthash.
-    pub fn set_head(&self, shorthash: &str) -> Result<(), LedgerError> {
-        let path = head_path(&self.kinora_root);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let tmp = path.with_extension("tmp");
-        fs::write(&tmp, shorthash)?;
-        fs::rename(&tmp, &path)?;
-        Ok(())
-    }
-
-    /// Mint a new lineage file from `event`, set HEAD to its shorthash, and
-    /// return the shorthash. Fails with `LineageAlreadyExists` if the target
-    /// file is already present — preserves the append-only invariant.
-    pub fn mint_and_append(&self, event: &Event) -> Result<String, LedgerError> {
-        self.ensure_layout()?;
-        let line = event.to_json_line()?;
-        let shorthash =
-            Hash::of_content(line.as_bytes()).shorthash().to_owned();
-        let file = ledger_file_path(&self.kinora_root, &shorthash);
-        write_line_exclusive(&file, &line).map_err(|e| match e.kind() {
-            io::ErrorKind::AlreadyExists => LedgerError::LineageAlreadyExists {
-                shorthash: shorthash.clone(),
-            },
-            _ => LedgerError::Io(e),
-        })?;
-        self.set_head(&shorthash)?;
-        Ok(shorthash)
-    }
-
-    /// Append `event` to the current HEAD lineage file. Returns the shorthash
-    /// on success. Errors: `NoHead` if HEAD is unset; `LineageMissing` if HEAD
-    /// points to a file that doesn't exist.
-    pub fn append_to_head(&self, event: &Event) -> Result<String, LedgerError> {
-        let shorthash = self.current_lineage()?.ok_or(LedgerError::NoHead)?;
-        let file = ledger_file_path(&self.kinora_root, &shorthash);
-        let line = event.to_json_line()?;
-        append_line_existing(&file, &line).map_err(|e| match e.kind() {
-            io::ErrorKind::NotFound => LedgerError::LineageMissing {
-                shorthash: shorthash.clone(),
-            },
-            _ => LedgerError::Io(e),
-        })?;
-        Ok(shorthash)
-    }
-
-    /// Read all events from a single lineage file by shorthash.
-    pub fn read_lineage(&self, shorthash: &str) -> Result<Vec<Event>, LedgerError> {
-        let file = ledger_file_path(&self.kinora_root, shorthash);
-        read_events(&file)
     }
 
     /// Write `event` to `.kinora/staged/<ab>/<event-hash>.jsonl`. Crash-atomic
@@ -134,9 +64,6 @@ impl Ledger {
     }
 
     /// Return every event stored under `.kinora/staged/`, deduped by event hash.
-    /// Does **not** read the legacy `.kinora/ledger/` layout — use
-    /// `read_all_lineages` for that. Callers that need both should call both
-    /// and merge.
     #[fastrace::trace]
     pub fn read_all_events(&self) -> Result<Vec<Event>, LedgerError> {
         let dir = staged_dir(&self.kinora_root);
@@ -165,46 +92,6 @@ impl Ledger {
         }
         Ok(out)
     }
-
-    /// Read all lineage files under `.kinora/ledger/` keyed by shorthash.
-    pub fn read_all_lineages(&self) -> Result<BTreeMap<String, Vec<Event>>, LedgerError> {
-        let dir = ledger_dir(&self.kinora_root);
-        if !dir.exists() {
-            return Ok(BTreeMap::new());
-        }
-        let mut out = BTreeMap::new();
-        for entry in fs::read_dir(&dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let stem = match path.file_stem().and_then(|s| s.to_str()) {
-                Some(s) if s.len() == SHORTHASH_LEN => s.to_owned(),
-                _ => continue,
-            };
-            let events = read_events(&path)?;
-            out.insert(stem, events);
-        }
-        Ok(out)
-    }
-}
-
-fn write_line_exclusive(path: &Path, line: &str) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut f = fs::OpenOptions::new().create_new(true).write(true).open(path)?;
-    f.write_all(line.as_bytes())?;
-    f.write_all(b"\n")?;
-    Ok(())
-}
-
-fn append_line_existing(path: &Path, line: &str) -> io::Result<()> {
-    let mut f = fs::OpenOptions::new().append(true).open(path)?;
-    f.write_all(line.as_bytes())?;
-    f.write_all(b"\n")?;
-    Ok(())
 }
 
 fn read_events(path: &Path) -> Result<Vec<Event>, LedgerError> {
@@ -248,126 +135,6 @@ mod tests {
             BTreeMap::from([("name".to_string(), n.to_string())]),
         )
     }
-
-    #[test]
-    fn head_starts_absent() {
-        let (_t, l) = ledger();
-        assert!(l.current_lineage().unwrap().is_none());
-    }
-
-    #[test]
-    fn mint_creates_lineage_and_sets_head() {
-        let (_t, l) = ledger();
-        let e = event("first", "2026-04-18T09:00:00Z");
-        let sh = l.mint_and_append(&e).unwrap();
-        assert_eq!(sh.len(), SHORTHASH_LEN);
-        assert_eq!(l.current_lineage().unwrap(), Some(sh.clone()));
-        let read = l.read_lineage(&sh).unwrap();
-        assert_eq!(read, vec![e]);
-    }
-
-    #[test]
-    fn append_to_head_requires_existing_head() {
-        let (_t, l) = ledger();
-        let e = event("x", "2026-04-18T09:00:00Z");
-        let err = l.append_to_head(&e).unwrap_err();
-        assert!(matches!(err, LedgerError::NoHead));
-    }
-
-    #[test]
-    fn append_adds_events_preserving_order() {
-        let (_t, l) = ledger();
-        let a = event("a", "2026-04-18T09:00:00Z");
-        let b = event("b", "2026-04-18T09:01:00Z");
-        let c = event("c", "2026-04-18T09:02:00Z");
-        let sh = l.mint_and_append(&a).unwrap();
-        l.append_to_head(&b).unwrap();
-        l.append_to_head(&c).unwrap();
-        let events = l.read_lineage(&sh).unwrap();
-        assert_eq!(events, vec![a, b, c]);
-    }
-
-    #[test]
-    fn ledger_is_append_only_prior_entries_not_modified() {
-        let (_t, l) = ledger();
-        let a = event("a", "2026-04-18T09:00:00Z");
-        let sh = l.mint_and_append(&a).unwrap();
-        let file = ledger_file_path(l.root(), &sh);
-        let before = fs::read(&file).unwrap();
-        let b = event("b", "2026-04-18T09:01:00Z");
-        l.append_to_head(&b).unwrap();
-        let after = fs::read(&file).unwrap();
-        assert!(after.starts_with(&before), "prior content mutated");
-    }
-
-    #[test]
-    fn read_all_lineages_collects_files() {
-        let (_t, l) = ledger();
-        let a = event("a", "2026-04-18T09:00:00Z");
-        let sh_a = l.mint_and_append(&a).unwrap();
-
-        let b = event("b", "2026-04-18T09:00:01Z");
-        let sh_b = Hash::of_content(b.to_json_line().unwrap().as_bytes())
-            .shorthash()
-            .to_owned();
-        let other = ledger_file_path(l.root(), &sh_b);
-        write_line_exclusive(&other, &b.to_json_line().unwrap()).unwrap();
-
-        let all = l.read_all_lineages().unwrap();
-        assert_eq!(all.len(), 2);
-        assert!(all.contains_key(&sh_a));
-        assert!(all.contains_key(&sh_b));
-    }
-
-    #[test]
-    fn read_all_lineages_skips_non_jsonl() {
-        let (_t, l) = ledger();
-        let a = event("a", "2026-04-18T09:00:00Z");
-        l.mint_and_append(&a).unwrap();
-        fs::write(ledger_dir(l.root()).join("notes.txt"), b"scratch").unwrap();
-        let all = l.read_all_lineages().unwrap();
-        assert_eq!(all.len(), 1);
-    }
-
-    #[test]
-    fn lineage_filename_matches_shorthash_of_first_event() {
-        let (_t, l) = ledger();
-        let a = event("a", "2026-04-18T09:00:00Z");
-        let line = a.to_json_line().unwrap();
-        let expected = Hash::of_content(line.as_bytes()).shorthash().to_owned();
-        let sh = l.mint_and_append(&a).unwrap();
-        assert_eq!(sh, expected);
-    }
-
-    #[test]
-    fn mint_refuses_when_lineage_file_already_exists() {
-        let (_t, l) = ledger();
-        let a = event("a", "2026-04-18T09:00:00Z");
-        l.mint_and_append(&a).unwrap();
-        let err = l.mint_and_append(&a).unwrap_err();
-        assert!(matches!(err, LedgerError::LineageAlreadyExists { .. }));
-    }
-
-    #[test]
-    fn append_to_head_errors_when_lineage_file_missing() {
-        let (_t, l) = ledger();
-        let a = event("a", "2026-04-18T09:00:00Z");
-        let sh = l.mint_and_append(&a).unwrap();
-        fs::remove_file(ledger_file_path(l.root(), &sh)).unwrap();
-        let b = event("b", "2026-04-18T09:01:00Z");
-        let err = l.append_to_head(&b).unwrap_err();
-        assert!(matches!(err, LedgerError::LineageMissing { .. }));
-    }
-
-    #[test]
-    fn set_head_overwrites_previous_value() {
-        let (_t, l) = ledger();
-        l.set_head("aaaaaaaa").unwrap();
-        l.set_head("bbbbbbbb").unwrap();
-        assert_eq!(l.current_lineage().unwrap().as_deref(), Some("bbbbbbbb"));
-    }
-
-    // ---- Staged-ledger tests (kinora-mjvb) ----
 
     #[test]
     fn write_event_creates_sharded_file_at_event_hash_path() {

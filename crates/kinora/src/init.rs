@@ -4,7 +4,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::config::{Config, ConfigError, RootPolicy, DEFAULT_INBOX_POLICY};
-use crate::paths::{config_path, kinora_root, ledger_dir, store_dir};
+use crate::paths::{config_path, kinora_root, store_dir};
 
 #[derive(Debug, thiserror::Error)]
 pub enum InitError {
@@ -22,9 +22,8 @@ pub enum InitError {
 
 /// Initialize `.kinora/` under `repo_root` with the given `repo_url`.
 ///
-/// Creates `config.styx` plus empty `store/` and `ledger/` directories.
-/// HEAD is not written here — the first `store` call mints a lineage file
-/// and sets HEAD.
+/// Creates `config.styx` plus an empty `store/` directory. `staged/` and
+/// `roots/` are created on first write.
 ///
 /// Refuses if `.kinora/` already exists.
 #[fastrace::trace]
@@ -35,7 +34,6 @@ pub fn init(repo_root: &Path, repo_url: &str) -> Result<Config, InitError> {
     }
     fs::create_dir_all(&root)?;
     fs::create_dir_all(store_dir(&root))?;
-    fs::create_dir_all(ledger_dir(&root))?;
     let cfg = Config {
         repo_url: repo_url.to_owned(),
         roots: BTreeMap::from([(
@@ -79,7 +77,7 @@ pub fn init_with_git_fallback(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::paths::{head_path, kinora_root};
+    use crate::paths::kinora_root;
     use std::fs;
     use tempfile::TempDir;
 
@@ -92,9 +90,8 @@ mod tests {
         assert!(root.is_dir());
         assert!(config_path(&root).is_file());
         assert!(store_dir(&root).is_dir());
-        assert!(ledger_dir(&root).is_dir());
-        // HEAD not yet written (minted on first store)
-        assert!(!head_path(&root).exists());
+        assert!(!root.join("ledger").exists(), "legacy ledger/ dir no longer created");
+        assert!(!root.join("HEAD").exists(), "legacy HEAD file no longer created");
     }
 
     #[test]

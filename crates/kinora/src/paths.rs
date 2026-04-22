@@ -4,10 +4,7 @@ use crate::hash::Hash;
 
 pub const KINORA_DIR: &str = ".kinora";
 pub const CONFIG_FILE: &str = "config.styx";
-pub const HEAD_FILE: &str = "HEAD";
 pub const STORE_DIR: &str = "store";
-pub const LEDGER_DIR: &str = "ledger";
-pub const LEDGER_EXT: &str = "jsonl";
 pub const STAGED_DIR: &str = "staged";
 pub const STAGED_EXT: &str = "jsonl";
 pub const ROOTS_DIR: &str = "roots";
@@ -20,16 +17,8 @@ pub fn config_path(kinora_root: &Path) -> PathBuf {
     kinora_root.join(CONFIG_FILE)
 }
 
-pub fn head_path(kinora_root: &Path) -> PathBuf {
-    kinora_root.join(HEAD_FILE)
-}
-
 pub fn store_dir(kinora_root: &Path) -> PathBuf {
     kinora_root.join(STORE_DIR)
-}
-
-pub fn ledger_dir(kinora_root: &Path) -> PathBuf {
-    kinora_root.join(LEDGER_DIR)
 }
 
 /// Path for a blob, extensionless. The legacy layout — still used for the
@@ -83,10 +72,6 @@ pub fn find_blob_path(kinora_root: &Path, hash: &Hash) -> Option<PathBuf> {
     None
 }
 
-pub fn ledger_file_path(kinora_root: &Path, shorthash: &str) -> PathBuf {
-    ledger_dir(kinora_root).join(format!("{shorthash}.{LEDGER_EXT}"))
-}
-
 pub fn staged_dir(kinora_root: &Path) -> PathBuf {
     kinora_root.join(STAGED_DIR)
 }
@@ -133,16 +118,9 @@ mod tests {
     }
 
     #[test]
-    fn head_at_expected_path() {
-        let kin = kinora_root(&root());
-        assert_eq!(head_path(&kin), PathBuf::from("/repo/.kinora/HEAD"));
-    }
-
-    #[test]
-    fn store_and_ledger_dirs() {
+    fn store_dir_at_expected_path() {
         let kin = kinora_root(&root());
         assert_eq!(store_dir(&kin), PathBuf::from("/repo/.kinora/store"));
-        assert_eq!(ledger_dir(&kin), PathBuf::from("/repo/.kinora/ledger"));
     }
 
     #[test]
@@ -156,15 +134,6 @@ mod tests {
             PathBuf::from(
                 "/repo/.kinora/store/af/af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
             )
-        );
-    }
-
-    #[test]
-    fn ledger_file_uses_shorthash() {
-        let kin = kinora_root(&root());
-        assert_eq!(
-            ledger_file_path(&kin, "af1349b9"),
-            PathBuf::from("/repo/.kinora/ledger/af1349b9.jsonl")
         );
     }
 

@@ -35,7 +35,7 @@ use crate::kinograph::{Kinograph, KinographError};
 use crate::ledger::{Ledger, LedgerError};
 use crate::namespace::ext_for_kind;
 use crate::paths::{
-    config_path, find_blob_path, ledger_dir, root_pointer_path, roots_dir, staged_dir, store_dir,
+    config_path, find_blob_path, root_pointer_path, roots_dir, staged_dir, store_dir,
 };
 use crate::root::{RootError, RootKinograph};
 use crate::store::{ContentStore, StoreError};
@@ -114,7 +114,6 @@ pub fn clone_repo(
     fs::create_dir_all(dst)?;
     fs::write(config_path(dst), &cfg_text)?;
     fs::create_dir_all(store_dir(dst))?;
-    fs::create_dir_all(ledger_dir(dst))?;
     fs::create_dir_all(staged_dir(dst))?;
     fs::create_dir_all(roots_dir(dst))?;
 
@@ -462,7 +461,7 @@ mod tests {
         assert!(store_dir(&dst).is_dir());
         assert!(staged_dir(&dst).is_dir());
         assert!(roots_dir(&dst).is_dir());
-        assert!(ledger_dir(&dst).is_dir());
+        assert!(!dst.join("ledger").exists(), "legacy ledger/ not created on clone");
 
         // config.styx copied verbatim
         let src_cfg = fs::read(config_path(&src)).unwrap();

@@ -92,10 +92,8 @@ pub struct Resolver {
 }
 
 impl Resolver {
-    /// Load all identities from every event recorded under `.kinora/`.
-    /// Reads both the new staged layout (`staged/<ab>/<event-hash>.jsonl`) and the
-    /// legacy per-lineage layout (`ledger/<lineage>.jsonl`) and unions them,
-    /// deduping by event hash. Events are grouped by `id`; heads precomputed.
+    /// Load all identities from every event recorded under `.kinora/staged/`.
+    /// Events are grouped by `id`; heads precomputed. Deduped by event hash.
     #[fastrace::trace]
     pub fn load(kinora_root: impl Into<std::path::PathBuf>) -> Result<Self, ResolveError> {
         let kinora_root = kinora_root.into();
@@ -103,25 +101,6 @@ impl Resolver {
 
         let mut seen: HashSet<String> = HashSet::new();
         let mut by_id: BTreeMap<String, Vec<(String, Event)>> = BTreeMap::new();
-
-        // Legacy layout: one file per lineage, each with many events. The
-        // lineage label is the filename shorthash — meaningful for legacy
-        // forks disambiguated by HEAD.
-        for (lineage, events) in ledger.read_all_lineages()? {
-            for event in events {
-                if !event.is_store_event() {
-                    continue;
-                }
-                let eh = event.event_hash().map_err(LedgerError::from)?;
-                if !seen.insert(eh.as_hex().to_owned()) {
-                    continue;
-                }
-                by_id
-                    .entry(event.id.clone())
-                    .or_default()
-                    .push((lineage.clone(), event));
-            }
-        }
 
         // Staged layout: one file per event. Per-event lineage label = event
         // hash shorthash.
@@ -235,24 +214,20 @@ impl Resolver {
             [] => return Err(ResolveError::NotFound { query: identity.id.clone() }),
             [only] => only.clone(),
             many => {
-                if let Some(unique) = self.head_for_current_lineage(identity, many)? {
-                    unique
-                } else {
-                    let lineages = many
-                        .iter()
-                        .map(|h| {
-                            identity
-                                .lineage_of(&h.hash)
-                                .unwrap_or("?")
-                                .to_owned()
-                        })
-                        .collect();
-                    return Err(ResolveError::MultipleHeads {
-                        id: identity.id.clone(),
-                        heads: many.to_vec(),
-                        lineages,
-                    });
-                }
+                let lineages = many
+                    .iter()
+                    .map(|h| {
+                        identity
+                            .lineage_of(&h.hash)
+                            .unwrap_or("?")
+                            .to_owned()
+                    })
+                    .collect();
+                return Err(ResolveError::MultipleHeads {
+                    id: identity.id.clone(),
+                    heads: many.to_vec(),
+                    lineages,
+                });
             }
         };
         let hash = parse_hash(&head.hash)?;
@@ -270,27 +245,6 @@ impl Resolver {
         })
     }
 
-    /// Branch-aware tiebreak: if HEAD points to a lineage and exactly one
-    /// of the candidate heads lives in that lineage, return it. Otherwise
-    /// Ok(None) so the caller reports a fork.
-    fn head_for_current_lineage(
-        &self,
-        identity: &Identity,
-        heads: &[Event],
-    ) -> Result<Option<Event>, ResolveError> {
-        let current = match Ledger::new(&self.kinora_root).current_lineage()? {
-            Some(l) => l,
-            None => return Ok(None),
-        };
-        let in_current: Vec<&Event> = heads
-            .iter()
-            .filter(|h| identity.lineage_of(&h.hash) == Some(current.as_str()))
-            .collect();
-        match in_current.as_slice() {
-            [only] => Ok(Some((*only).clone())),
-            _ => Ok(None),
-        }
-    }
 }
 
 /// Walk `.kinora/roots/` pointer files and synthesize identity entries from
@@ -544,137 +498,6 @@ mod tests {
             .resolve_at_version(&birth.event.id, &bogus)
             .unwrap_err();
         assert!(matches!(err, ResolveError::VersionNotFound { .. }));
-    }
-
-    #[test]
-    fn branch_aware_tiebreak_still_works_for_legacy_lineage_files() {
-        // Under the staged-ledger layout, per-event files don't participate in
-        // HEAD-based tiebreak (all events live in their own file, so none
-        // shares a lineage with HEAD). The tiebreaker is retained only for
-        // legacy `.kinora/ledger/<lineage>.jsonl` files so previously-written
-        // data still disambiguates correctly. Simulate a legacy fork by
-        // writing raw lineage files directly.
-        let (_t, root) = setup();
-        let ledger = Ledger::new(&root);
-        let store = ContentStore::new(&root);
-        store.ensure_layout().unwrap();
-        ledger.ensure_layout().unwrap();
-
-        // Birth + v2 sharing one legacy lineage file.
-        let birth_hash = store.write("markdown", b"v1").unwrap();
-        let birth = Event::new_store(
-            "markdown".into(),
-            birth_hash.as_hex().into(),
-            birth_hash.as_hex().into(),
-            vec![],
-            "2026-04-18T10:00:00Z".into(),
-            "yj".into(),
-            "legacy".into(),
-            BTreeMap::from([("name".into(), "doc".into())]),
-        );
-        let sh_a = ledger.mint_and_append(&birth).unwrap();
-
-        let v2_hash = store.write("markdown", b"v2").unwrap();
-        let v2 = Event::new_store(
-            "markdown".into(),
-            birth.id.clone(),
-            v2_hash.as_hex().into(),
-            vec![birth.hash.clone()],
-            "2026-04-18T10:00:01Z".into(),
-            "yj".into(),
-            "legacy".into(),
-            BTreeMap::from([("name".into(), "doc".into())]),
-        );
-        ledger.append_to_head(&v2).unwrap();
-
-        // Sibling head in a separate legacy lineage file.
-        std::fs::remove_file(crate::paths::head_path(&root)).unwrap();
-        let sibling_hash = store.write("markdown", b"right").unwrap();
-        let sibling = Event::new_store(
-            "markdown".into(),
-            birth.id.clone(),
-            sibling_hash.as_hex().into(),
-            vec![birth.hash.clone()],
-            "2026-04-18T10:00:02Z".into(),
-            "yj".into(),
-            "legacy".into(),
-            BTreeMap::from([("name".into(), "doc".into())]),
-        );
-        ledger.mint_and_append(&sibling).unwrap();
-
-        // Point HEAD at the first (A-lineage) file.
-        ledger.set_head(&sh_a).unwrap();
-
-        let resolver = Resolver::load(&root).unwrap();
-        let resolved = resolver.resolve_by_id(&birth.id).unwrap();
-        // v2 lives in the HEAD lineage, so the tiebreaker picks it.
-        assert_eq!(resolved.content, b"v2");
-        assert_eq!(resolved.head.hash, v2.hash);
-        assert_eq!(resolved.all_heads.len(), 2);
-    }
-
-    #[test]
-    fn resolver_groups_events_across_staged_and_legacy_stores() {
-        // Two independent identities — one new (via store_kino → staged), one
-        // legacy (hand-written into `ledger/`). Resolver::load must surface
-        // both.
-        let (_t, root) = setup();
-        let a = store_kino(&root, params("markdown", b"hi", "a")).unwrap();
-
-        // Legacy: write a birth event directly to a new lineage file.
-        let ledger = Ledger::new(&root);
-        let store = ContentStore::new(&root);
-        let legacy_hash = store.write("markdown", b"bye").unwrap();
-        let legacy_event = Event::new_store(
-            "markdown".into(),
-            legacy_hash.as_hex().into(),
-            legacy_hash.as_hex().into(),
-            vec![],
-            "2026-04-18T10:00:01Z".into(),
-            "yj".into(),
-            "legacy".into(),
-            BTreeMap::from([("name".into(), "b".into())]),
-        );
-        std::fs::remove_file(crate::paths::head_path(&root)).ok();
-        ledger.mint_and_append(&legacy_event).unwrap();
-
-        let resolver = Resolver::load(&root).unwrap();
-        assert!(resolver.identities().contains_key(&a.event.id));
-        assert!(resolver.identities().contains_key(&legacy_event.id));
-    }
-
-    #[test]
-    fn resolver_dedups_when_same_event_lives_in_both_staged_and_legacy() {
-        // During the transition, the same logical event may appear in both
-        // layouts — e.g. a legacy lineage file still on disk alongside a staged
-        // event file. Resolver must dedup by event hash so heads/parents don't
-        // double-count.
-        let (_t, root) = setup();
-        let ledger = Ledger::new(&root);
-        let store = ContentStore::new(&root);
-        store.ensure_layout().unwrap();
-        ledger.ensure_layout().unwrap();
-
-        let content_hash = store.write("markdown", b"same").unwrap();
-        let event = Event::new_store(
-            "markdown".into(),
-            content_hash.as_hex().into(),
-            content_hash.as_hex().into(),
-            vec![],
-            "2026-04-18T10:00:00Z".into(),
-            "yj".into(),
-            "dual-layout".into(),
-            BTreeMap::from([("name".into(), "dual".into())]),
-        );
-
-        ledger.mint_and_append(&event).unwrap();
-        let (_, was_new) = ledger.write_event(&event).unwrap();
-        assert!(was_new, "staged write should have created a new file");
-
-        let resolver = Resolver::load(&root).unwrap();
-        let identity = resolver.identities().get(&event.id).expect("identity present");
-        assert_eq!(identity.events.len(), 1, "duplicate event not deduped");
-        assert_eq!(identity.heads.len(), 1);
     }
 
     #[test]
