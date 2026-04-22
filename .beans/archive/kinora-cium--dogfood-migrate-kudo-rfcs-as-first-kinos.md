@@ -1,11 +1,11 @@
 ---
 # kinora-cium
 title: 'Dogfood: migrate kudo RFCs as first kinos'
-status: in-progress
+status: completed
 type: task
 priority: normal
 created_at: 2026-04-18T09:16:59Z
-updated_at: 2026-04-19T04:04:52Z
+updated_at: 2026-04-22T14:20:38Z
 parent: kinora-w7w0
 blocked_by:
     - kinora-860i
@@ -43,3 +43,8 @@ Dogfood RFC-0003 into this repo (kinora) as the first kino.
 5. Defer kinograph composition until RFC-0001 and RFC-0002 are also imported — one-entry kinographs add no value.
 
 Acceptance bounded to RFC-0003 only for this commit; follow-up stores for RFC-0001/0002 + a `kudo-rfcs` kinograph can be a second pass.
+
+----
+
+Currently put design principles into the .kinora/ here, the RFCs will be kept as RFCs
+Consider this task finished.

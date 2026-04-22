@@ -1,11 +1,11 @@
 ---
 # kinora-w7w0
 title: Kinora bootstrap
-status: todo
+status: completed
 type: epic
 priority: normal
 created_at: 2026-04-18T09:16:59Z
-updated_at: 2026-04-19T05:38:46Z
+updated_at: 2026-04-22T14:20:52Z
 ---
 
 ## Scope
