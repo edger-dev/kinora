@@ -68,15 +68,24 @@ impl Mirror {
     /// mirror lacks. A put is a conditional create: a file the mirror already
     /// holds is never overwritten, even when another machine put it a moment
     /// ago.
+    ///
+    /// What this machine already sent (or fetched) through this mirror is
+    /// remembered in `.kinora/remote/`, so a push with nothing new costs no
+    /// request at all. Blobs go before the events that cite them.
     pub async fn push(&self, kinora_root: &Path) -> Result<SyncReport, RemoteError> {
-        let remote = self.remote_files().await?;
+        let mut synced = self.synced(kinora_root)?;
         let mut report = SyncReport::default();
         for rel in local_files(kinora_root)? {
-            if remote.contains(&rel) {
+            if synced.contains(&rel) {
                 report.present += 1;
                 continue;
             }
-            let bytes = std::fs::read(kinora_root.join(&rel))?;
+            let bytes = match std::fs::read(kinora_root.join(&rel)) {
+                Ok(bytes) => bytes,
+                // Renamed or removed under us: nothing to send.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
             let opts = PutOptions {
                 mode: PutMode::Create,
                 ..Default::default()
@@ -90,6 +99,7 @@ impl Mirror {
                 Err(object_store::Error::AlreadyExists { .. }) => report.present += 1,
                 Err(e) => return Err(e.into()),
             }
+            synced.record(&rel)?;
         }
         Ok(report)
     }
@@ -97,20 +107,23 @@ impl Mirror {
     /// Fetch every mirrored write-once file the store at `kinora_root` lacks.
     /// A blob whose bytes do not hash to its name is refused, never written.
     pub async fn pull(&self, kinora_root: &Path) -> Result<SyncReport, RemoteError> {
+        let mut synced = self.synced(kinora_root)?;
         let mut report = SyncReport::default();
         let mut remote: Vec<String> = self.remote_files().await?.into_iter().collect();
-        remote.sort();
+        remote.sort_by(|a, b| sync_order(a).cmp(&sync_order(b)));
         for rel in remote {
             if has_locally(kinora_root, &rel) {
                 report.present += 1;
+                synced.record(&rel)?;
                 continue;
             }
             let bytes = self.store.get(&self.key(&rel)).await?.bytes().await?;
-            if rel.starts_with("store/") && !blob_matches(&rel, &bytes) {
+            if !content_matches(&rel, &bytes) {
                 report.rejected.push(rel);
                 continue;
             }
             write_atomically(&kinora_root.join(&rel), &bytes)?;
+            synced.record(&rel)?;
             report.copied += 1;
         }
         Ok(report)
@@ -186,6 +199,16 @@ impl Mirror {
         self.prefix.as_ref()
     }
 
+    /// What this machine has sent or fetched through this mirror.
+    fn synced(&self, kinora_root: &Path) -> Result<Synced, RemoteError> {
+        let name = Hash::of_content(format!("{}\n{}", self.store, self.prefix).as_bytes());
+        Synced::open(
+            &kinora_root
+                .join("remote")
+                .join(format!("{}.synced", &name.as_hex()[..16])),
+        )
+    }
+
     fn key(&self, rel: &str) -> Key {
         if self.prefix.as_ref().is_empty() {
             Key::from(rel)
@@ -256,14 +279,35 @@ pub mod blocking {
     }
 }
 
-/// `tree/<ab>/<name>` under a write-once tree, not a temporary file.
+/// A file kinora itself names: `store/<ab>/<hash>[.<ext>]` or
+/// `staged/<ab>/<hash>.jsonl`, the shard being the hash's first two digits.
+/// Temporary files (`.tmp-*`, `*.jsonl.tmp`, `.pull-*`) never match.
 fn is_write_once(rel: &str) -> bool {
     let parts: Vec<&str> = rel.split('/').collect();
-    matches!(parts.as_slice(), [tree, shard, name]
-        if TREES.contains(tree)
-            && shard.len() == 2
-            && !name.starts_with('.')
-            && !name.contains('\\'))
+    let [tree, shard, name] = parts.as_slice() else {
+        return false;
+    };
+    let (stem, ext) = match name.split_once('.') {
+        Some((stem, ext)) => (stem, Some(ext)),
+        None => (*name, None),
+    };
+    let hex = stem.len() == 64
+        && stem
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase());
+    let ext_ok = match (*tree, ext) {
+        ("store", None) => true,
+        ("store", Some(e)) => !e.is_empty() && e.bytes().all(|b| b.is_ascii_alphanumeric()),
+        ("staged", Some("jsonl")) => true,
+        _ => false,
+    };
+    hex && ext_ok && stem.get(..2) == Some(*shard)
+}
+
+/// Blobs before the events that cite them, on push and on pull: an
+/// interrupted sync leaves blobs without events, never events without blobs.
+fn sync_order(rel: &str) -> (u8, &str) {
+    (u8::from(rel.starts_with("staged/")), rel)
 }
 
 /// The store's write-once files, as relative paths with `/` separators.
@@ -271,8 +315,10 @@ fn local_files(kinora_root: &Path) -> std::io::Result<Vec<String>> {
     let mut out = Vec::new();
     for tree in TREES {
         let base = kinora_root.join(tree);
-        let Ok(shards) = std::fs::read_dir(&base) else {
-            continue;
+        let shards = match std::fs::read_dir(&base) {
+            Ok(shards) => shards,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
         };
         for shard in shards {
             let shard = shard?;
@@ -284,18 +330,21 @@ fn local_files(kinora_root: &Path) -> std::io::Result<Vec<String>> {
                 if !file.file_type()?.is_file() {
                     continue;
                 }
-                let rel = format!(
-                    "{tree}/{}/{}",
-                    shard.file_name().to_string_lossy(),
-                    file.file_name().to_string_lossy()
-                );
+                // A name that is not UTF-8 is not one kinora wrote.
+                let (Some(shard_name), Some(file_name)) = (
+                    shard.file_name().to_str().map(str::to_owned),
+                    file.file_name().to_str().map(str::to_owned),
+                ) else {
+                    continue;
+                };
+                let rel = format!("{tree}/{shard_name}/{file_name}");
                 if is_write_once(&rel) {
                     out.push(rel);
                 }
             }
         }
     }
-    out.sort();
+    out.sort_by(|a, b| sync_order(a).cmp(&sync_order(b)));
     Ok(out)
 }
 
@@ -316,8 +365,26 @@ fn stem_hash(rel: &str) -> Option<Hash> {
     stem.parse().ok()
 }
 
-fn blob_matches(rel: &str, bytes: &[u8]) -> bool {
-    stem_hash(rel).is_some_and(|h| Hash::of_content(bytes) == h)
+/// Whether a mirrored file is what its name says: a blob's bytes hash to it;
+/// an event is one canonical event line (plus its newline) that hashes to it.
+fn content_matches(rel: &str, bytes: &[u8]) -> bool {
+    let Some(name) = stem_hash(rel) else {
+        return false;
+    };
+    if rel.starts_with("store/") {
+        return Hash::of_content(bytes) == name;
+    }
+    let Some(line) = bytes.strip_suffix(b"\n") else {
+        return false;
+    };
+    if line.contains(&b'\n') || Hash::of_content(line) != name {
+        return false;
+    }
+    std::str::from_utf8(line)
+        .ok()
+        .and_then(|l| kinora::event::Event::from_json_line(l).ok())
+        .and_then(|e| e.event_hash().ok())
+        .is_some_and(|h| h == name)
 }
 
 /// Write then rename, under a dot-name the sync itself skips, so a crashed
@@ -331,7 +398,52 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let tmp: PathBuf = dir.join(format!(".pull-{name}"));
+    // A name of its own per pull, so two pulls into one store cannot write
+    // the same temporary.
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp: PathBuf = dir.join(format!(".pull-{}-{n}-{name}", std::process::id()));
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(tmp, path)
+}
+
+/// The files a store has sent or fetched through one mirror: one path per
+/// line, appended as each lands. A torn last line only costs a resend.
+struct Synced {
+    path: PathBuf,
+    seen: HashSet<String>,
+}
+
+impl Synced {
+    fn open(path: &Path) -> Result<Self, RemoteError> {
+        let seen = match std::fs::read_to_string(path) {
+            Ok(text) => text.lines().map(str::to_owned).collect(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashSet::new(),
+            Err(e) => return Err(e.into()),
+        };
+        Ok(Self {
+            path: path.to_owned(),
+            seen,
+        })
+    }
+
+    fn contains(&self, rel: &str) -> bool {
+        self.seen.contains(rel)
+    }
+
+    fn record(&mut self, rel: &str) -> Result<(), RemoteError> {
+        use std::io::Write;
+        if !self.seen.insert(rel.to_owned()) {
+            return Ok(());
+        }
+        if let Some(dir) = self.path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        f.write_all(format!("{rel}\n").as_bytes())?;
+        Ok(())
+    }
 }
