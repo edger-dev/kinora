@@ -122,3 +122,38 @@ fn an_unreachable_s3_endpoint_fails_fast() {
         started.elapsed()
     );
 }
+
+/// A mirror that refuses this machine — bad keys, no permission — says so,
+/// whichever way the store reports it, so callers never mistake it for an
+/// outage.
+#[test]
+fn a_refusal_is_told_apart_from_an_outage() {
+    let refused = [
+        object_store::Error::PermissionDenied {
+            path: "p".into(),
+            source: "denied".into(),
+        },
+        object_store::Error::Unauthenticated {
+            path: "p".into(),
+            source: "who".into(),
+        },
+        object_store::Error::Generic {
+            store: "S3",
+            source: "Server returned non-2xx status code: 403 Forbidden: SignatureDoesNotMatch"
+                .into(),
+        },
+        object_store::Error::Generic {
+            store: "S3",
+            source: "Server returned non-2xx status code: 401 Unauthorized".into(),
+        },
+    ];
+    for e in refused {
+        assert!(RemoteError::Store(e).is_refused());
+    }
+    let outage = object_store::Error::Generic {
+        store: "S3",
+        source: "error sending request: connection refused".into(),
+    };
+    assert!(!RemoteError::Store(outage).is_refused());
+    assert!(!RemoteError::Io(std::io::Error::other("disk")).is_refused());
+}

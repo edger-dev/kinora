@@ -41,6 +41,14 @@ pub enum RemoteError {
     Url(String),
 }
 
+impl RemoteError {
+    /// Whether the mirror refused this machine (credentials, permissions) —
+    /// a misconfiguration, as opposed to an outage worth working around.
+    pub fn is_refused(&self) -> bool {
+        false
+    }
+}
+
 /// What one push or pull did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SyncReport {
