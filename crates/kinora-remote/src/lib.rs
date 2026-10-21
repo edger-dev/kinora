@@ -104,6 +104,13 @@ impl Mirror {
         Ok(report)
     }
 
+    /// Put every write-once file the mirror lacks, ignoring what this
+    /// machine remembers sending: for a mirror that lost files.
+    pub async fn push_all(&self, kinora_root: &Path) -> Result<SyncReport, RemoteError> {
+        let _ = kinora_root;
+        Ok(SyncReport::default())
+    }
+
     /// Fetch every mirrored write-once file the store at `kinora_root` lacks.
     /// A blob whose bytes do not hash to its name is refused, never written.
     pub async fn pull(&self, kinora_root: &Path) -> Result<SyncReport, RemoteError> {

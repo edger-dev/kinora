@@ -388,3 +388,21 @@ impl ObjectStore for CountingLists {
         self.inner.copy_opts(from, to, options).await
     }
 }
+
+/// A mirror that lost files (a wiped bucket) is refilled by a full push,
+/// which ignores what this machine remembers sending.
+#[tokio::test]
+async fn a_full_push_refills_a_mirror_that_lost_files() {
+    let root = store_with("refill", &["# one\n"]);
+    let remote = Arc::new(InMemory::new());
+    let mirror = Mirror::new(remote.clone(), "ctx");
+    mirror.push(&root).await.unwrap();
+    let all = keys(remote.as_ref(), "ctx").await;
+    for k in &all {
+        remote.delete(&Key::from(k.as_str())).await.unwrap();
+    }
+    assert_eq!(mirror.push(&root).await.unwrap().copied, 0, "remembered");
+    let refill = mirror.push_all(&root).await.unwrap();
+    assert_eq!(refill.copied, all.len());
+    assert_eq!(keys(remote.as_ref(), "ctx").await, all);
+}
