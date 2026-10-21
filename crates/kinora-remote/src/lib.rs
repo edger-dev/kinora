@@ -207,6 +207,14 @@ impl Mirror {
                         .map_err(|e| RemoteError::Url(format!("option {}: {e}", key.as_ref())))?;
                     s3 = s3.with_config(key, value);
                 }
+                // A local S3 (MinIO for development) speaks plain HTTP: an
+                // http:// endpoint is consent to it.
+                if s3
+                    .get_config_value(&AmazonS3ConfigKey::Endpoint)
+                    .is_some_and(|e| e.starts_with("http://"))
+                {
+                    s3 = s3.with_allow_http(true);
+                }
                 Ok(Self::new(Arc::new(s3.build()?), &path))
             }
             "file" => {
@@ -282,6 +290,11 @@ pub mod blocking {
     /// [`Mirror::push`], blocking.
     pub fn push(mirror: &Mirror, kinora_root: &Path) -> Result<SyncReport, RemoteError> {
         run(mirror.push(kinora_root))
+    }
+
+    /// [`Mirror::push_all`], blocking.
+    pub fn push_all(mirror: &Mirror, kinora_root: &Path) -> Result<SyncReport, RemoteError> {
+        run(mirror.push_all(kinora_root))
     }
 
     /// [`Mirror::pull`], blocking.
