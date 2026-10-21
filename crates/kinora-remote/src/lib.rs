@@ -18,6 +18,9 @@ use std::sync::Arc;
 use futures::TryStreamExt;
 use kinora::hash::Hash;
 use kinora::paths::find_blob_path;
+use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
+use object_store::local::LocalFileSystem;
+use object_store::memory::InMemory;
 use object_store::path::Path as Key;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 
@@ -116,8 +119,11 @@ impl Mirror {
     /// A mirror named by URL, configured from the environment (`AWS_*` for
     /// `s3://`).
     pub fn from_url(url: &str) -> Result<Self, RemoteError> {
-        let _ = url;
-        Err(RemoteError::Url("not yet".into()))
+        Self::build(
+            url,
+            AmazonS3Builder::from_env(),
+            Vec::<(String, String)>::new(),
+        )
     }
 
     /// A mirror named by URL, with explicit options (for `s3://`, the
@@ -130,8 +136,49 @@ impl Mirror {
         K: AsRef<str>,
         V: Into<String>,
     {
-        let _ = (url, options.into_iter().count());
-        Err(RemoteError::Url("not yet".into()))
+        Self::build(url, AmazonS3Builder::new(), options)
+    }
+
+    fn build<K, V>(
+        url: &str,
+        s3: AmazonS3Builder,
+        options: impl IntoIterator<Item = (K, V)>,
+    ) -> Result<Self, RemoteError>
+    where
+        K: AsRef<str>,
+        V: Into<String>,
+    {
+        let parsed = url::Url::parse(url).map_err(|e| RemoteError::Url(format!("{url}: {e}")))?;
+        let path = parsed.path().trim_matches('/').to_owned();
+        match parsed.scheme() {
+            "s3" => {
+                let bucket = parsed
+                    .host_str()
+                    .filter(|b| !b.is_empty())
+                    .ok_or_else(|| RemoteError::Url(format!("{url}: no bucket")))?;
+                let mut s3 = s3.with_bucket_name(bucket);
+                for (key, value) in options {
+                    let key: AmazonS3ConfigKey = key
+                        .as_ref()
+                        .parse()
+                        .map_err(|e| RemoteError::Url(format!("option {}: {e}", key.as_ref())))?;
+                    s3 = s3.with_config(key, value);
+                }
+                Ok(Self::new(Arc::new(s3.build()?), &path))
+            }
+            "file" => {
+                let dir = PathBuf::from(format!("/{path}"));
+                std::fs::create_dir_all(&dir)?;
+                Ok(Self::new(
+                    Arc::new(LocalFileSystem::new_with_prefix(&dir)?),
+                    "",
+                ))
+            }
+            "memory" => Ok(Self::new(Arc::new(InMemory::new()), &path)),
+            other => Err(RemoteError::Url(format!(
+                "{url}: scheme {other} is not one of s3, file, memory"
+            ))),
+        }
     }
 
     /// The prefix inside the object store the mirror lives under.
@@ -179,14 +226,33 @@ pub mod blocking {
 
     use crate::{Mirror, RemoteError, SyncReport};
 
+    /// [`Mirror::push`], blocking.
     pub fn push(mirror: &Mirror, kinora_root: &Path) -> Result<SyncReport, RemoteError> {
-        let _ = (mirror, kinora_root);
-        Ok(SyncReport::default())
+        run(mirror.push(kinora_root))
     }
 
+    /// [`Mirror::pull`], blocking.
     pub fn pull(mirror: &Mirror, kinora_root: &Path) -> Result<SyncReport, RemoteError> {
-        let _ = (mirror, kinora_root);
-        Ok(SyncReport::default())
+        run(mirror.pull(kinora_root))
+    }
+
+    /// Drive a future to completion on a runtime of its own, on a thread of
+    /// its own: safe from plain code and from inside another runtime alike.
+    fn run<F>(future: F) -> Result<SyncReport, RemoteError>
+    where
+        F: std::future::Future<Output = Result<SyncReport, RemoteError>> + Send,
+    {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()?
+                        .block_on(future)
+                })
+                .join()
+                .map_err(|_| RemoteError::Io(std::io::Error::other("the sync thread panicked")))?
+        })
     }
 }
 
