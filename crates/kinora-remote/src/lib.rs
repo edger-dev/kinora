@@ -45,7 +45,20 @@ impl RemoteError {
     /// Whether the mirror refused this machine (credentials, permissions) —
     /// a misconfiguration, as opposed to an outage worth working around.
     pub fn is_refused(&self) -> bool {
-        false
+        match self {
+            Self::Store(
+                object_store::Error::PermissionDenied { .. }
+                | object_store::Error::Unauthenticated { .. },
+            ) => true,
+            // A refused list comes back generic, with the status in the text.
+            Self::Store(e @ object_store::Error::Generic { .. }) => {
+                let text = e.to_string();
+                ["403 Forbidden", "401 Unauthorized"]
+                    .iter()
+                    .any(|status| text.contains(status))
+            }
+            _ => false,
+        }
     }
 }
 
