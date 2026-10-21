@@ -73,10 +73,24 @@ impl Mirror {
     /// remembered in `.kinora/remote/`, so a push with nothing new costs no
     /// request at all. Blobs go before the events that cite them.
     pub async fn push(&self, kinora_root: &Path) -> Result<SyncReport, RemoteError> {
+        self.push_files(kinora_root, true).await
+    }
+
+    /// Put every write-once file the mirror lacks, ignoring what this
+    /// machine remembers sending: for a mirror that lost files.
+    pub async fn push_all(&self, kinora_root: &Path) -> Result<SyncReport, RemoteError> {
+        self.push_files(kinora_root, false).await
+    }
+
+    async fn push_files(
+        &self,
+        kinora_root: &Path,
+        remembered: bool,
+    ) -> Result<SyncReport, RemoteError> {
         let mut synced = self.synced(kinora_root)?;
         let mut report = SyncReport::default();
         for rel in local_files(kinora_root)? {
-            if synced.contains(&rel) {
+            if remembered && synced.contains(&rel) {
                 report.present += 1;
                 continue;
             }
@@ -102,13 +116,6 @@ impl Mirror {
             synced.record(&rel)?;
         }
         Ok(report)
-    }
-
-    /// Put every write-once file the mirror lacks, ignoring what this
-    /// machine remembers sending: for a mirror that lost files.
-    pub async fn push_all(&self, kinora_root: &Path) -> Result<SyncReport, RemoteError> {
-        let _ = kinora_root;
-        Ok(SyncReport::default())
     }
 
     /// Fetch every mirrored write-once file the store at `kinora_root` lacks.
