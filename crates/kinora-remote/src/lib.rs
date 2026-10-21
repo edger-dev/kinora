@@ -14,6 +14,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::TryStreamExt;
 use kinora::hash::Hash;
@@ -22,6 +23,7 @@ use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::path::Path as Key;
+use object_store::{ClientOptions, RetryConfig};
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 
 /// The write-once trees: the only parts of a store that sync.
@@ -183,7 +185,21 @@ impl Mirror {
                     .host_str()
                     .filter(|b| !b.is_empty())
                     .ok_or_else(|| RemoteError::Url(format!("{url}: no bucket")))?;
-                let mut s3 = s3.with_bucket_name(bucket);
+                // Short budgets: a machine that cannot reach the mirror falls
+                // back to its local store, and must find that out in seconds,
+                // not after minutes of retries.
+                let mut s3 = s3
+                    .with_bucket_name(bucket)
+                    .with_client_options(
+                        ClientOptions::new()
+                            .with_connect_timeout(Duration::from_secs(3))
+                            .with_timeout(Duration::from_secs(8)),
+                    )
+                    .with_retry(RetryConfig {
+                        max_retries: 1,
+                        retry_timeout: Duration::from_secs(8),
+                        ..RetryConfig::default()
+                    });
                 for (key, value) in options {
                     let key: AmazonS3ConfigKey = key
                         .as_ref()
