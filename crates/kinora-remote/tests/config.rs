@@ -97,3 +97,28 @@ async fn the_blocking_face_works_inside_an_async_runtime() {
     let report = blocking::push(&mirror, &a).unwrap();
     assert!(report.copied > 0);
 }
+
+/// An unreachable S3 endpoint fails in seconds, not after a minute of
+/// retries: kudo's hooks fall back to working locally and must not stall.
+#[test]
+fn an_unreachable_s3_endpoint_fails_fast() {
+    let mirror = Mirror::from_url_with(
+        "s3://bucket/prefix",
+        [
+            ("aws_access_key_id", "k"),
+            ("aws_secret_access_key", "s"),
+            ("aws_endpoint", "http://10.255.255.1:9"),
+            ("aws_region", "auto"),
+            ("aws_allow_http", "true"),
+        ],
+    )
+    .unwrap();
+    let root = store_with("unreachable", &["# x\n"]);
+    let started = std::time::Instant::now();
+    assert!(blocking::pull(&mirror, &root).is_err());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(15),
+        "took {:?}",
+        started.elapsed()
+    );
+}
