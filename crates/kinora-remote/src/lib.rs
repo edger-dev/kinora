@@ -31,6 +31,9 @@ pub enum RemoteError {
     Io(#[from] std::io::Error),
     #[error("object store: {0}")]
     Store(#[from] object_store::Error),
+    /// The mirror URL cannot be used: why.
+    #[error("mirror url: {0}")]
+    Url(String),
 }
 
 /// What one push or pull did.
@@ -110,6 +113,32 @@ impl Mirror {
         Ok(report)
     }
 
+    /// A mirror named by URL, configured from the environment (`AWS_*` for
+    /// `s3://`).
+    pub fn from_url(url: &str) -> Result<Self, RemoteError> {
+        let _ = url;
+        Err(RemoteError::Url("not yet".into()))
+    }
+
+    /// A mirror named by URL, with explicit options (for `s3://`, the
+    /// `object_store` S3 config keys such as `aws_access_key_id`).
+    pub fn from_url_with<K, V>(
+        url: &str,
+        options: impl IntoIterator<Item = (K, V)>,
+    ) -> Result<Self, RemoteError>
+    where
+        K: AsRef<str>,
+        V: Into<String>,
+    {
+        let _ = (url, options.into_iter().count());
+        Err(RemoteError::Url("not yet".into()))
+    }
+
+    /// The prefix inside the object store the mirror lives under.
+    pub fn prefix(&self) -> &str {
+        self.prefix.as_ref()
+    }
+
     fn key(&self, rel: &str) -> Key {
         if self.prefix.as_ref().is_empty() {
             Key::from(rel)
@@ -141,6 +170,23 @@ impl Mirror {
                 is_write_once(&rel).then_some(rel)
             })
             .collect())
+    }
+}
+
+/// The mirror for sync callers.
+pub mod blocking {
+    use std::path::Path;
+
+    use crate::{Mirror, RemoteError, SyncReport};
+
+    pub fn push(mirror: &Mirror, kinora_root: &Path) -> Result<SyncReport, RemoteError> {
+        let _ = (mirror, kinora_root);
+        Ok(SyncReport::default())
+    }
+
+    pub fn pull(mirror: &Mirror, kinora_root: &Path) -> Result<SyncReport, RemoteError> {
+        let _ = (mirror, kinora_root);
+        Ok(SyncReport::default())
     }
 }
 

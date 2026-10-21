@@ -11,7 +11,9 @@ workspace = true
 
 [dependencies]
 kinora = { path = "../kinora" }
-object_store = { version = "0.14.2", default-features = false, features = ["fs"] }
+object_store = { version = "0.14.2", default-features = false, features = ["fs", "aws"] }
+tokio = { version = "1", features = ["rt"] }
+url = "2"
 futures = "0.3"
 thiserror = { workspace = true }
 
