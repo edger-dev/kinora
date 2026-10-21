@@ -224,3 +224,167 @@ async fn a_mirror_on_the_local_filesystem_round_trips() {
     mirror.pull(&target).await.unwrap();
     assert_eq!(write_once_files(&source), write_once_files(&target));
 }
+
+/// A staged event must be one canonical event line, named by its hash: a
+/// garbage file or a forged event never lands, and the store still loads.
+#[tokio::test]
+async fn pull_refuses_a_staged_event_that_is_not_what_its_name_says() {
+    let source = store_with("ev-src", &["# real\n"]);
+    let remote = Arc::new(InMemory::new());
+    let mirror = Mirror::new(remote.clone(), "ctx");
+    mirror.push(&source).await.unwrap();
+
+    // A real event's line, filed under another event's name.
+    let events: Vec<String> = write_once_files(&source)
+        .into_iter()
+        .filter(|p| p.starts_with("staged/"))
+        .collect();
+    let real = std::fs::read(source.join(&events[0])).unwrap();
+    let forged_name = format!("staged/ab/{}.jsonl", "ab".repeat(32));
+    remote
+        .put(
+            &Key::from(format!("ctx/{forged_name}")),
+            PutPayload::from(real),
+        )
+        .await
+        .unwrap();
+    let garbage_name = format!("staged/cd/{}.jsonl", "cd".repeat(32));
+    remote
+        .put(
+            &Key::from(format!("ctx/{garbage_name}")),
+            PutPayload::from_static(b"garbage\n"),
+        )
+        .await
+        .unwrap();
+
+    let target = store_with("ev-dst", &[]);
+    let report = mirror.pull(&target).await.unwrap();
+    let mut rejected = report.rejected.clone();
+    rejected.sort();
+    assert_eq!(rejected, [forged_name.clone(), garbage_name.clone()]);
+    assert!(!target.join(&forged_name).exists());
+    assert!(!target.join(&garbage_name).exists());
+    assert_eq!(Resolver::load(&target).unwrap().identities().len(), 1);
+}
+
+/// kinora's own temporary files — `.tmp-*` blobs, `*.jsonl.tmp` events —
+/// never leave the machine.
+#[tokio::test]
+async fn push_skips_kinora_temporary_files() {
+    let root = store_with("tmp", &["# one\n"]);
+    let shard = std::fs::read_dir(root.join("staged"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::write(shard.join(format!("{}.jsonl.tmp", "ef".repeat(32))), "half").unwrap();
+    let remote = Arc::new(InMemory::new());
+    Mirror::new(remote.clone(), "ctx")
+        .push(&root)
+        .await
+        .unwrap();
+    let sent = keys(remote.as_ref(), "ctx").await;
+    assert!(sent.iter().all(|k| !k.ends_with(".tmp")), "{sent:?}");
+}
+
+/// A blob in a shard folder that is not its hash's is not a blob kinora can
+/// see: it is ignored, not fetched again on every pull.
+#[tokio::test]
+async fn pull_ignores_a_blob_in_the_wrong_shard() {
+    let remote = Arc::new(InMemory::new());
+    let bytes = b"# misplaced\n";
+    let hash = kinora::hash::Hash::of_content(bytes);
+    remote
+        .put(
+            &Key::from(format!("ctx/store/zz/{}.md", hash.as_hex())),
+            PutPayload::from_static(bytes),
+        )
+        .await
+        .unwrap();
+    let target = store_with("shard", &[]);
+    let mirror = Mirror::new(remote, "ctx");
+    assert_eq!(mirror.pull(&target).await.unwrap().copied, 0);
+    assert_eq!(mirror.pull(&target).await.unwrap().copied, 0);
+}
+
+/// Push sends only what this machine has not sent before: a second push
+/// with nothing new does not even list the mirror.
+#[tokio::test]
+async fn a_push_with_nothing_new_lists_nothing() {
+    let root = store_with("marker", &["# one\n"]);
+    let counting = Arc::new(CountingLists::default());
+    let mirror = Mirror::new(counting.clone(), "ctx");
+    mirror.push(&root).await.unwrap();
+    let before = counting.lists.load(Ordering::Relaxed);
+    let again = mirror.push(&root).await.unwrap();
+    assert_eq!(again.copied, 0);
+    assert_eq!(counting.lists.load(Ordering::Relaxed), before, "no LIST");
+}
+
+/// An in-memory store that counts LIST calls.
+#[derive(Debug, Default)]
+struct CountingLists {
+    inner: InMemory,
+    lists: std::sync::atomic::AtomicUsize,
+}
+
+impl std::fmt::Display for CountingLists {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CountingLists")
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for CountingLists {
+    async fn put_opts(
+        &self,
+        location: &Key,
+        payload: PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+    async fn put_multipart_opts(
+        &self,
+        location: &Key,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+    async fn get_opts(
+        &self,
+        location: &Key,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<'static, object_store::Result<Key>>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<Key>> {
+        self.inner.delete_stream(locations)
+    }
+    fn list(
+        &self,
+        prefix: Option<&Key>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.lists.fetch_add(1, Ordering::Relaxed);
+        self.inner.list(prefix)
+    }
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Key>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.lists.fetch_add(1, Ordering::Relaxed);
+        self.inner.list_with_delimiter(prefix).await
+    }
+    async fn copy_opts(
+        &self,
+        from: &Key,
+        to: &Key,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
