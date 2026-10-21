@@ -1,0 +1,19 @@
+[package]
+name = "kinora-remote"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Mirror a kinora store's write-once files to an object store"
+
+[lints]
+workspace = true
+
+[dependencies]
+kinora = { path = "../kinora" }
+object_store = { version = "0.14.2", default-features = false, features = ["fs"] }
+futures = "0.3"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

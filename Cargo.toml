@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/kinora",
     "crates/kinora-cli",
+    "crates/kinora-remote",
     "crates/stencil",
     "crates/stencil-cli",
 ]
