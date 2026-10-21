@@ -8,7 +8,7 @@
 //! never overwriting) and `pull` fetches what the store lacks; there is
 //! nothing to merge.
 //!
-//! implements: b4e072636ef26d99d9b0f32227da47d9c11e93d8b458e4631af57c4c31a9ba57@b4e072636ef26d99d9b0f32227da47d9c11e93d8b458e4631af57c4c31a9ba57
+//! implements: b4e072636ef26d99d9b0f32227da47d9c11e93d8b458e4631af57c4c31a9ba57@e7980f316714ef8cacb7d4f87058a644fde9a63d22ac4ca01bc828a99029e6b1
 //! task: c650f51df78e4018da6bb0ec59a22aa08d52708167f3490e3194f9cd67d2383c@4657166511ff29b05c2582477054dc890fe6dd33e815fcd38f0203d2a4d035c4
 
 use std::collections::HashSet;

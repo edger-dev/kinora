@@ -1,0 +1,2 @@
+{"@schema":"kinora-commit-archive-v1"}
+{"event_kind":"store","kind":"markdown","id":"b4e072636ef26d99d9b0f32227da47d9c11e93d8b458e4631af57c4c31a9ba57","hash":"e7980f316714ef8cacb7d4f87058a644fde9a63d22ac4ca01bc828a99029e6b1","parents":["b4e072636ef26d99d9b0f32227da47d9c11e93d8b458e4631af57c4c31a9ba57"],"ts":"2026-10-21T04:17:55.031968112Z","author":"YJ Park","provenance":"kudo phase 3 review","metadata":{"name":"a-store-syncs-with-an-object-store","status::active":"true"}}

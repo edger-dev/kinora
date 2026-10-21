@@ -2,7 +2,7 @@
 //! environment or explicit options), `file:///dir`, `memory://` — and a
 //! blocking face for sync callers, safe to call from inside an async runtime.
 //!
-//! implements: b4e072636ef26d99d9b0f32227da47d9c11e93d8b458e4631af57c4c31a9ba57@b4e072636ef26d99d9b0f32227da47d9c11e93d8b458e4631af57c4c31a9ba57
+//! implements: b4e072636ef26d99d9b0f32227da47d9c11e93d8b458e4631af57c4c31a9ba57@e7980f316714ef8cacb7d4f87058a644fde9a63d22ac4ca01bc828a99029e6b1
 
 #![allow(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 
