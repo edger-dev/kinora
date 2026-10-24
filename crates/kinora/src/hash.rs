@@ -1,58 +1,7 @@
-use std::fmt;
-use std::str::FromStr;
+//! Content hashes: moco's, re-exported, so kinora and the places it keeps
+//! its bytes in agree on one type.
 
-const HASH_HEX_LEN: usize = 64;
-pub const SHORTHASH_LEN: usize = 8;
-
-#[derive(Debug, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
-pub struct Hash(String);
-
-#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
-pub enum HashParseError {
-    #[error("hash must be {HASH_HEX_LEN} hex chars, got {got}")]
-    WrongLength { got: usize },
-    #[error("hash must be lowercase hex [0-9a-f]")]
-    NotLowerHex,
-}
-
-impl Hash {
-    pub fn of_content(content: &[u8]) -> Self {
-        let hex = blake3::hash(content).to_hex().to_string();
-        Self(hex)
-    }
-
-    pub fn as_hex(&self) -> &str {
-        &self.0
-    }
-
-    pub fn shorthash(&self) -> &str {
-        &self.0[..SHORTHASH_LEN]
-    }
-
-    pub fn shard(&self) -> &str {
-        &self.0[..2]
-    }
-}
-
-impl FromStr for Hash {
-    type Err = HashParseError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s.len() != HASH_HEX_LEN {
-            return Err(HashParseError::WrongLength { got: s.len() });
-        }
-        if !s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
-            return Err(HashParseError::NotLowerHex);
-        }
-        Ok(Self(s.to_owned()))
-    }
-}
-
-impl fmt::Display for Hash {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
+pub use moco_place::{Hash, HashParseError, SHORTHASH_LEN};
 
 #[cfg(test)]
 mod tests {
@@ -71,7 +20,11 @@ mod tests {
     fn hash_output_is_64_hex_chars() {
         let h = Hash::of_content(b"hello");
         assert_eq!(h.as_hex().len(), 64);
-        assert!(h.as_hex().chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(
+            h.as_hex()
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
     }
 
     #[test]

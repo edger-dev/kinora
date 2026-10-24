@@ -14,9 +14,21 @@
 //! implements: 02be1c37832e1c710030e7bc5a89441b55bdbf5a05ebe2c501f824708b7f3372@02be1c37832e1c710030e7bc5a89441b55bdbf5a05ebe2c501f824708b7f3372
 //! task: a1bac9ab38a30da7fd5d5dde31176490b567a3a9625d4eb119649175bac7e9b6@90d573a7ed7cedc54296d959ee6c4a67ad6d471804cf1397a361652155ab4987
 
+use std::collections::BTreeSet;
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
+
+use moco_place::{FsPlace, Key, Stream};
 
 use crate::hash::Hash;
+use crate::paths::{root_pointer_path, roots_dir};
+use crate::root::RootKinograph;
+use crate::store::{ContentStore, StoreError};
+
+/// Root versions are root kinographs in the styxl format.
+const EXT: &str = "styxl";
 
 /// Why a root's versions could not be read or written.
 #[derive(Debug, thiserror::Error)]
@@ -25,36 +37,136 @@ pub enum RootsError {
     Io(#[from] std::io::Error),
     #[error("roots place: {0}")]
     Place(#[from] moco_place::PlaceError),
+    #[error("roots content store: {0}")]
+    Store(#[from] StoreError),
     #[error("invalid root pointer at {}: {body:?}", .path.display())]
     InvalidPointer { path: PathBuf, body: String },
     #[error("root {name:?} cannot be a stream name: {reason}")]
     InvalidName { name: String, reason: String },
 }
 
-/// Every root with committed versions, sorted: streams and legacy pointers.
-pub fn root_names(_kinora_root: &Path) -> Result<Vec<String>, RootsError> {
-    Ok(Vec::new())
+/// Every root with committed versions, sorted: streams and legacy pointers
+/// (an interrupted migration's aside copy included).
+pub fn root_names(kinora_root: &Path) -> Result<Vec<String>, RootsError> {
+    let entries = match fs::read_dir(roots_dir(kinora_root)) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut names = BTreeSet::new();
+    for entry in entries {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if let Some(rest) = name.strip_prefix('.') {
+            if let Some(aside) = rest.strip_suffix(".legacy") {
+                names.insert(aside.to_owned());
+            }
+            continue;
+        }
+        let kind = entry.file_type()?;
+        if kind.is_dir() || kind.is_file() {
+            names.insert(name);
+        }
+    }
+    Ok(names.into_iter().collect())
 }
 
 /// A root's current versions, oldest first: one normally, several after
 /// concurrent commits, none before the first commit.
-pub fn root_heads(_kinora_root: &Path, _name: &str) -> Result<Vec<Hash>, RootsError> {
+pub fn root_heads(kinora_root: &Path, name: &str) -> Result<Vec<Hash>, RootsError> {
+    let pointer = root_pointer_path(kinora_root, name);
+    if pointer.is_dir() {
+        let place = FsPlace::create(kinora_root)?;
+        let heads: Vec<Hash> = stream_for(name)?
+            .heads(&place, &parents_of)?
+            .into_iter()
+            .map(|e| e.hash)
+            .collect();
+        if !heads.is_empty() {
+            return Ok(heads);
+        }
+    } else if pointer.is_file() {
+        return Ok(vec![read_pointer(&pointer)?]);
+    }
+    let aside = aside_path(kinora_root, name);
+    if aside.is_file() {
+        return Ok(vec![read_pointer(&aside)?]);
+    }
     Ok(Vec::new())
 }
 
 /// Append `bytes` (a root kinograph) as the root's newest version, migrating
 /// a legacy pointer first; the version's hash.
 pub fn append_root_version(
-    _kinora_root: &Path,
-    _name: &str,
+    kinora_root: &Path,
+    name: &str,
     bytes: &[u8],
 ) -> Result<Hash, RootsError> {
-    Ok(Hash::of_content(bytes))
+    migrate_root(kinora_root, name)?;
+    let place = FsPlace::create(kinora_root)?;
+    Ok(stream_for(name)?.append(&place, bytes)?.hash)
 }
 
 /// Move a legacy pointer onto the stream; whether there was one to move.
-pub fn migrate_root(_kinora_root: &Path, _name: &str) -> Result<bool, RootsError> {
-    Ok(false)
+/// Renamed aside first, so a crash at any point leaves the version readable.
+pub fn migrate_root(kinora_root: &Path, name: &str) -> Result<bool, RootsError> {
+    let stream = stream_for(name)?;
+    let pointer = root_pointer_path(kinora_root, name);
+    let aside = aside_path(kinora_root, name);
+    if pointer.is_file() {
+        fs::rename(&pointer, &aside)?;
+    }
+    if !aside.is_file() {
+        return Ok(false);
+    }
+    let hash = read_pointer(&aside)?;
+    let place = FsPlace::create(kinora_root)?;
+    // A migration resumed after its append already landed adds nothing.
+    if !stream.entries(&place)?.iter().any(|e| e.hash == hash) {
+        let bytes = ContentStore::new(kinora_root).read(&hash)?;
+        stream.append(&place, &bytes)?;
+    }
+    fs::remove_file(&aside)?;
+    Ok(true)
+}
+
+fn stream_for(name: &str) -> Result<Stream, RootsError> {
+    let invalid = |e: moco_place::KeyError| RootsError::InvalidName {
+        name: name.to_owned(),
+        reason: e.to_string(),
+    };
+    let key = Key::new("roots")
+        .map_err(invalid)?
+        .join(name)
+        .map_err(invalid)?;
+    Ok(Stream::new(key).with_ext(EXT))
+}
+
+fn aside_path(kinora_root: &Path, name: &str) -> PathBuf {
+    roots_dir(kinora_root).join(format!(".{name}.legacy"))
+}
+
+fn read_pointer(path: &Path) -> Result<Hash, RootsError> {
+    let body = fs::read_to_string(path)?;
+    Hash::from_str(body.trim_end_matches(['\r', '\n'])).map_err(|_| RootsError::InvalidPointer {
+        path: path.to_path_buf(),
+        body,
+    })
+}
+
+/// A root version's parents, from its header; none if it does not parse.
+fn parents_of(bytes: &[u8]) -> Vec<Hash> {
+    RootKinograph::parse(bytes)
+        .map(|kg| {
+            kg.header
+                .parents
+                .iter()
+                .filter_map(|p| p.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -74,11 +186,13 @@ mod tests {
         (tmp, root)
     }
 
-    fn entry(id: &str) -> RootEntry {
-        let h = Hash::of_content(id.as_bytes());
+    /// An entry named after `name` (its id and version are hashes of it).
+    fn entry(name: &str) -> RootEntry {
+        let id = Hash::of_content(name.as_bytes());
+        let version = Hash::of_content(format!("{name} v1").as_bytes());
         RootEntry::new(
-            id,
-            h.as_hex(),
+            id.as_hex(),
+            version.as_hex(),
             "markdown",
             Default::default(),
             "2026-10-24T00:00:00Z",
