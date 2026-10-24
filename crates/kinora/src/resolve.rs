@@ -5,7 +5,7 @@ use std::str::FromStr;
 use crate::event::Event;
 use crate::hash::{Hash, HashParseError};
 use crate::ledger::{Ledger, LedgerError};
-use crate::roots::{root_heads, root_names, RootsError};
+use crate::roots::{root_heads, root_names, RootHistory, RootsError};
 use crate::root::{RootError, RootKinograph};
 use crate::store::{ContentStore, StoreError};
 
@@ -294,7 +294,15 @@ fn ingest_root_kinographs(
     // a fork the head detection reports.
     let mut kinographs = Vec::new();
     for name_str in &names {
-        for root_hash in root_heads(kinora_root, name_str).map_err(roots_error)? {
+        let heads = root_heads(kinora_root, name_str).map_err(roots_error)?;
+        if heads.len() > 1 {
+            // Every root version back to the heads' common base, so a kino
+            // revised on one side reads as the chain it is, not a fork.
+            let history = RootHistory::walk(kinora_root, &heads).map_err(roots_error)?;
+            kinographs.extend(history.walked);
+            continue;
+        }
+        for root_hash in heads {
             let bytes = store.read(&root_hash)?;
             kinographs.push(RootKinograph::parse(&bytes)?);
         }

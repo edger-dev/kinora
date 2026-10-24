@@ -14,7 +14,7 @@
 //! implements: 02be1c37832e1c710030e7bc5a89441b55bdbf5a05ebe2c501f824708b7f3372@02be1c37832e1c710030e7bc5a89441b55bdbf5a05ebe2c501f824708b7f3372
 //! task: a1bac9ab38a30da7fd5d5dde31176490b567a3a9625d4eb119649175bac7e9b6@90d573a7ed7cedc54296d959ee6c4a67ad6d471804cf1397a361652155ab4987
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -41,6 +41,8 @@ pub enum RootsError {
     Place(#[from] moco_place::PlaceError),
     #[error("roots content store: {0}")]
     Store(#[from] StoreError),
+    #[error("roots kinograph: {0}")]
+    Root(#[from] crate::root::RootError),
     #[error("invalid root pointer at {}: {body:?}", .path.display())]
     InvalidPointer { path: PathBuf, body: String },
     #[error("root {name:?} cannot be a stream name: {reason}")]
@@ -175,6 +177,144 @@ fn stream_pointer(kinora_root: &Path, stream: &Stream, path: &Path) -> Result<()
     match fs::remove_file(path) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e.into()),
         _ => Ok(()),
+    }
+}
+
+/// What a root's history tells about its heads: their common base version,
+/// every root version between the heads and that base, and the kino-version
+/// ancestry those versions (and any events added) record.
+///
+/// Root versions name their prior versions in their headers, so the walk
+/// needs only the content store. Only walked when a root has several heads.
+#[derive(Debug, Default)]
+pub struct RootHistory {
+    /// The latest version every head descends from; `None` when the heads
+    /// share no history (two first commits).
+    pub base: Option<RootKinograph>,
+    /// The root versions from each head back to the base, inclusive.
+    pub walked: Vec<RootKinograph>,
+    /// Kino version → its parents.
+    ancestry: HashMap<String, Vec<String>>,
+}
+
+impl RootHistory {
+    /// Walk the history of `heads` through the content store. A version
+    /// missing from the store ends its branch of the walk.
+    pub fn walk(kinora_root: &Path, heads: &[Hash]) -> Result<Self, RootsError> {
+        let store = ContentStore::new(kinora_root);
+        let mut versions: HashMap<String, RootKinograph> = HashMap::new();
+        let mut ancestors_of: Vec<HashSet<String>> = Vec::new();
+        for head in heads {
+            let mut seen = HashSet::new();
+            let mut queue = vec![head.as_hex().to_owned()];
+            while let Some(hex) = queue.pop() {
+                if !seen.insert(hex.clone()) {
+                    continue;
+                }
+                let kg = match versions.get(&hex) {
+                    Some(kg) => kg.clone(),
+                    None => {
+                        let Ok(hash) = Hash::from_str(&hex) else {
+                            continue;
+                        };
+                        let Ok(bytes) = store.read(&hash) else {
+                            continue;
+                        };
+                        let kg = RootKinograph::parse(&bytes)?;
+                        versions.insert(hex.clone(), kg.clone());
+                        kg
+                    }
+                };
+                queue.extend(kg.header.parents.iter().cloned());
+            }
+            ancestors_of.push(seen);
+        }
+        // The common ancestors, and among them the latest: one no other
+        // common ancestor descends from. Ties go to the smallest hash.
+        let mut common: Vec<String> = ancestors_of
+            .first()
+            .map(|first| {
+                first
+                    .iter()
+                    .filter(|v| ancestors_of.iter().all(|a| a.contains(*v)))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        common.sort();
+        let below = |v: &str| -> HashSet<String> {
+            let mut seen = HashSet::new();
+            let mut queue: Vec<String> = versions
+                .get(v)
+                .map(|kg| kg.header.parents.clone())
+                .unwrap_or_default();
+            while let Some(hex) = queue.pop() {
+                if seen.insert(hex.clone())
+                    && let Some(kg) = versions.get(&hex)
+                {
+                    queue.extend(kg.header.parents.iter().cloned());
+                }
+            }
+            seen
+        };
+        let base_hex = common
+            .iter()
+            .find(|c| !common.iter().any(|d| d != *c && below(d).contains(*c)))
+            .cloned();
+        let older = base_hex.as_deref().map(below).unwrap_or_default();
+        let mut walked_hex: Vec<String> = ancestors_of
+            .iter()
+            .flatten()
+            .filter(|v| !older.contains(*v))
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        walked_hex.retain(|v| versions.contains_key(v));
+        let mut history = Self {
+            base: base_hex.and_then(|b| versions.get(&b).cloned()),
+            walked: walked_hex
+                .iter()
+                .filter_map(|v| versions.get(v).cloned())
+                .collect(),
+            ancestry: HashMap::new(),
+        };
+        let walked = std::mem::take(&mut history.walked);
+        for kg in &walked {
+            for entry in &kg.entries {
+                history.add(&entry.version, &entry.parents);
+            }
+        }
+        history.walked = walked;
+        Ok(history)
+    }
+
+    /// Record that `version` has `parents`.
+    pub fn add(&mut self, version: &str, parents: &[String]) {
+        let known = self.ancestry.entry(version.to_owned()).or_default();
+        for p in parents {
+            if !known.contains(p) {
+                known.push(p.clone());
+            }
+        }
+    }
+
+    /// Whether kino version `a` is `b` or descends from it, as far as the
+    /// recorded ancestry shows.
+    pub fn descends(&self, a: &str, b: &str) -> bool {
+        let mut seen = HashSet::new();
+        let mut queue = vec![a.to_owned()];
+        while let Some(v) = queue.pop() {
+            if v == b {
+                return true;
+            }
+            if seen.insert(v.clone())
+                && let Some(parents) = self.ancestry.get(&v)
+            {
+                queue.extend(parents.iter().cloned());
+            }
+        }
+        false
     }
 }
 

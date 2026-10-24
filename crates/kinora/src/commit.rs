@@ -34,7 +34,7 @@ use crate::kino::{store_kino, StoreKinoError, StoreKinoParams};
 use crate::kinograph::{Kinograph, KinographError};
 use crate::ledger::{Ledger, LedgerError};
 use crate::paths::{config_path, staged_event_path};
-use crate::roots::{append_root_version, root_heads, RootsError};
+use crate::roots::{append_root_version, root_heads, RootHistory, RootsError};
 use crate::root::{RootEntry, RootError, RootKinograph};
 use crate::store::{ContentStore, StoreError};
 
@@ -694,15 +694,26 @@ fn commit_root_with_refs(
     // fields across commits. Loaded before `build_root` so the merge
     // step can pick up entries whose store events have been pruned.
     //
-    // Several heads (concurrent commits) are folded first: their entries
-    // unioned, a kino they disagree on settled by descent where one version
-    // names the other, else left for the check after the build.
+    // Several heads (concurrent commits) are folded first, three-way
+    // against their common base: see `fold_heads`. The history walk also
+    // records kino ancestry, from the root versions walked and the staged
+    // events, for the settled check after the build.
     let store = ContentStore::new(kinora_root);
     let mut priors = Vec::with_capacity(heads.len());
     for head in &heads {
         priors.push(RootKinograph::parse(&store.read(head)?)?);
     }
-    let (prior_root, disputed) = fold_heads(&priors);
+    let mut history = if heads.len() > 1 {
+        RootHistory::walk(kinora_root, &heads)?
+    } else {
+        RootHistory::default()
+    };
+    for e in events {
+        if e.is_store_event() {
+            history.add(&e.hash, &e.parents);
+        }
+    }
+    let (prior_root, disputed) = fold_heads(&priors, &history);
 
     // Never and MaxAge roots get prior-root merge in `build_root`. After
     // archival, Never/MaxAge drain their committed events from staging —
@@ -717,16 +728,16 @@ fn commit_root_with_refs(
     let mut root = build_root(events, root_name, declared_roots, owned, merge_source)?;
     propagate_pins(&mut root, prior_root.as_ref());
 
-    // A disputed kino is settled when the fresh build carries a version
-    // other than the disputed ones (a merge stored since). Otherwise the
-    // heads fork on it, and nothing here may pick a side.
+    // A disputed kino is settled only when the fresh build carries a version
+    // descending from every disputed one (a merge stored since). Otherwise
+    // the heads fork on it, and nothing here may pick a side.
     let unsettled: Vec<(String, Vec<String>)> = disputed
         .into_iter()
         .filter(|(id, versions)| {
-            root.entries
-                .iter()
-                .find(|e| &e.id == id)
-                .is_some_and(|e| versions.contains(&e.version))
+            match root.entries.iter().find(|e| &e.id == id) {
+                Some(e) => !versions.iter().all(|v| history.descends(&e.version, v)),
+                None => true,
+            }
         })
         .collect();
     if !unsettled.is_empty() {
@@ -757,14 +768,35 @@ fn commit_root_with_refs(
     // payload; subsequent versions carry the prior lineage id forward and
     // record the prior blob hash as the parent.
     let fresh_entries = std::mem::take(&mut root.entries);
+    // A commit that only folds heads is stamped from the heads alone, so
+    // two machines folding the same heads write the same version and the
+    // fold does not fork again.
+    let fold_only = heads.len() > 1
+        && prior_root
+            .as_ref()
+            .is_some_and(|p| p.entries == fresh_entries);
+    let (ts, author, provenance) = if fold_only {
+        let latest = priors
+            .iter()
+            .map(|p| p.header.ts.clone())
+            .max()
+            .unwrap_or_default();
+        (latest, "kinora".to_owned(), "fold".to_owned())
+    } else {
+        (
+            params.ts.clone(),
+            params.author.clone(),
+            params.provenance.clone(),
+        )
+    };
     let root = match (prior_root.as_ref(), prior_version.as_ref()) {
         (Some(prior), Some(_)) => RootKinograph::new_child(
             prior.header.id.clone(),
             heads.iter().map(|h| h.as_hex().to_owned()).collect(),
             fresh_entries,
-            params.ts.clone(),
-            params.author.clone(),
-            params.provenance.clone(),
+            ts,
+            author,
+            provenance,
         ),
         _ => RootKinograph::new_genesis(
             fresh_entries,
@@ -1021,12 +1053,24 @@ fn drop_staged_events(
 /// Ownership wins over pin on cross-root moves: a kino reassigned away
 /// from this root simply won't appear in the rebuild (routing filtered
 /// it out), so its prior pinned entry is silently dropped.
-/// Fold a root's heads into one prior: entries unioned by id. Where heads
-/// disagree on a kino's version, the one naming the other as a parent wins;
-/// failing that, the kino is disputed — returned with every version heard,
-/// for the caller to check against the fresh build. The fold's header is
-/// the first head's (its lineage id), smallest lineage id first.
-fn fold_heads(heads: &[RootKinograph]) -> (Option<RootKinograph>, BTreeMap<String, Vec<String>>) {
+/// Fold a root's heads into one prior, three-way against their common
+/// base (`history.base`):
+///
+/// - a kino whose heads hold one version, or where one version descends
+///   (through the walked history) from every other, takes that version —
+///   unless a head pins it, and then the pin holds;
+/// - a kino the base had, that some head dropped (moved to another root, or
+///   aged out) while every head still holding it left it as the base had
+///   it, stays dropped;
+/// - a kino the heads hold at versions none of which descends from all the
+///   others is disputed: returned with every version, for the caller to
+///   check against the fresh build.
+///
+/// The fold's header is that of the head with the smallest lineage id.
+fn fold_heads(
+    heads: &[RootKinograph],
+    history: &RootHistory,
+) -> (Option<RootKinograph>, BTreeMap<String, Vec<String>>) {
     let mut disputed: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let Some(first) = heads.iter().min_by(|a, b| a.header.id.cmp(&b.header.id)) else {
         return (None, disputed);
@@ -1034,40 +1078,74 @@ fn fold_heads(heads: &[RootKinograph]) -> (Option<RootKinograph>, BTreeMap<Strin
     if heads.len() == 1 {
         return (Some(first.clone()), disputed);
     }
-    let mut by_id: BTreeMap<String, RootEntry> = BTreeMap::new();
-    for head in heads {
-        for entry in &head.entries {
-            match by_id.get(&entry.id) {
-                None => {
-                    by_id.insert(entry.id.clone(), entry.clone());
-                }
-                Some(kept) if kept.version == entry.version => {
-                    let mut merged = kept.clone();
-                    for p in &entry.parents {
-                        if !merged.parents.contains(p) {
-                            merged.parents.push(p.clone());
-                        }
-                    }
-                    merged.pin |= entry.pin;
-                    by_id.insert(entry.id.clone(), merged);
-                }
-                Some(kept) if entry.parents.contains(&kept.version) => {
-                    by_id.insert(entry.id.clone(), entry.clone());
-                }
-                Some(kept) if kept.parents.contains(&entry.version) => {}
-                Some(kept) => {
-                    let versions = disputed.entry(entry.id.clone()).or_default();
-                    for v in [&kept.version, &entry.version] {
-                        if !versions.contains(v) {
-                            versions.push(v.clone());
-                        }
-                    }
-                }
+    let base: BTreeMap<&str, &RootEntry> = history
+        .base
+        .iter()
+        .flat_map(|b| b.entries.iter().map(|e| (e.id.as_str(), e)))
+        .collect();
+    let ids: BTreeSet<&str> = heads
+        .iter()
+        .flat_map(|h| h.entries.iter().map(|e| e.id.as_str()))
+        .collect();
+    let mut folded_entries = Vec::new();
+    for id in ids {
+        let present: Vec<&RootEntry> = heads
+            .iter()
+            .filter_map(|h| h.entries.iter().find(|e| e.id == id))
+            .collect();
+        if let Some(was) = base.get(id)
+            && present.len() < heads.len()
+            && present.iter().all(|e| e.version == was.version)
+        {
+            // Dropped on one side, untouched on the others.
+            continue;
+        }
+        let mut versions: Vec<&str> = Vec::new();
+        for e in &present {
+            if !versions.contains(&e.version.as_str()) {
+                versions.push(&e.version);
             }
         }
+        let pinned: BTreeSet<&str> = present
+            .iter()
+            .filter(|e| e.pin)
+            .map(|e| e.version.as_str())
+            .collect();
+        let winner: Option<&str> = match pinned.len() {
+            0 => versions
+                .iter()
+                .copied()
+                .find(|v| versions.iter().all(|w| history.descends(v, w))),
+            1 => pinned.iter().next().copied(),
+            _ => None,
+        };
+        let Some(winner) = winner else {
+            disputed.insert(
+                id.to_owned(),
+                versions.iter().map(|v| (*v).to_owned()).collect(),
+            );
+            // A placeholder; the check after the build decides.
+            folded_entries.push(present[0].clone());
+            continue;
+        };
+        let mut entry = present
+            .iter()
+            .find(|e| e.version == winner && (e.pin || pinned.is_empty()))
+            .or_else(|| present.iter().find(|e| e.version == winner))
+            .map(|e| (*e).clone())
+            .unwrap_or_else(|| present[0].clone());
+        for e in present.iter().filter(|e| e.version == winner) {
+            for p in &e.parents {
+                if !entry.parents.contains(p) {
+                    entry.parents.push(p.clone());
+                }
+            }
+            entry.pin |= e.pin;
+        }
+        folded_entries.push(entry);
     }
     let mut folded = first.clone();
-    folded.entries = by_id.into_values().collect();
+    folded.entries = folded_entries;
     (Some(folded), disputed)
 }
 
@@ -1083,6 +1161,8 @@ fn propagate_pins(root: &mut RootKinograph, prior: Option<&RootKinograph>) {
         if let Some(prior_entry) = pinned.get(entry.id.as_str()) {
             entry.pin = true;
             entry.version = prior_entry.version.clone();
+            // The parents of the version it names, not of the fresh head.
+            entry.parents = prior_entry.parents.clone();
             // head_ts must track the version it names — otherwise a pinned
             // entry would report the *fresh* head's ts while pointing at
             // the prior version's hash.

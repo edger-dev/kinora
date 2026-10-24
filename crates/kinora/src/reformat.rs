@@ -23,7 +23,7 @@ use std::io;
 use std::path::Path;
 use std::str::FromStr;
 
-use crate::commit::{read_root_pointer, CommitError};
+use crate::commit::{read_root_heads, CommitError};
 use crate::config::{Config, ConfigError};
 use crate::event::{Event, EventError};
 use crate::hash::{Hash, HashParseError};
@@ -126,10 +126,12 @@ pub fn reformat_repo(
     // drained inner kinograph that is NOT itself a root entry by reading
     // its content via the pin (see the synthesize-from-hint block below).
     let mut to_visit: Vec<(String, Option<String>)> = Vec::new();
+    // Every head of every root: kinographs only one head reaches count too.
+    let mut heads = Vec::new();
     for root_name in config.roots.keys() {
-        let Some(hash) = read_root_pointer(kinora_root, root_name)? else {
-            continue;
-        };
+        heads.extend(read_root_heads(kinora_root, root_name)?);
+    }
+    for hash in heads {
         let content = store.read(&hash)?;
         let root_kg = RootKinograph::parse(&content)?;
         for entry in &root_kg.entries {
