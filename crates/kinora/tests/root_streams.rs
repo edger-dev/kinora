@@ -428,3 +428,23 @@ fn two_machines_folding_the_same_heads_agree() {
         "the two folds are one version"
     );
 }
+
+/// Several revisions stored before one commit on one side (the in-between
+/// versions never reach a root version) are still a linear history.
+#[test]
+fn revisions_folded_into_one_commit_are_not_a_fork() {
+    let (_t, a) = repo();
+    let doc = store(&a, "v1", "doc", None, &[]);
+    commit(&a).unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let b = branch(&a, other.path());
+    let v2 = store(&a, "v2", "doc", Some(&doc), &[&doc]);
+    store(&a, "v3", "doc", Some(&doc), &[&v2]);
+    commit(&a).unwrap();
+    store(&b, "unrelated", "other", None, &[]);
+    commit(&b).unwrap();
+    merge(&b, &a);
+    assert_eq!(resolves(&a, "doc"), "v3");
+    commit(&a).unwrap();
+    assert_eq!(resolves(&a, "doc"), "v3");
+}

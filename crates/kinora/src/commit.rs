@@ -34,7 +34,7 @@ use crate::kino::{store_kino, StoreKinoError, StoreKinoParams};
 use crate::kinograph::{Kinograph, KinographError};
 use crate::ledger::{Ledger, LedgerError};
 use crate::paths::{config_path, staged_event_path};
-use crate::roots::{append_root_version, root_heads, RootHistory, RootsError};
+use crate::roots::{append_root_version, fold_heads, root_heads, RootHistory, RootsError};
 use crate::root::{RootEntry, RootError, RootKinograph};
 use crate::store::{ContentStore, StoreError};
 
@@ -1053,102 +1053,6 @@ fn drop_staged_events(
 /// Ownership wins over pin on cross-root moves: a kino reassigned away
 /// from this root simply won't appear in the rebuild (routing filtered
 /// it out), so its prior pinned entry is silently dropped.
-/// Fold a root's heads into one prior, three-way against their common
-/// base (`history.base`):
-///
-/// - a kino whose heads hold one version, or where one version descends
-///   (through the walked history) from every other, takes that version —
-///   unless a head pins it, and then the pin holds;
-/// - a kino the base had, that some head dropped (moved to another root, or
-///   aged out) while every head still holding it left it as the base had
-///   it, stays dropped;
-/// - a kino the heads hold at versions none of which descends from all the
-///   others is disputed: returned with every version, for the caller to
-///   check against the fresh build.
-///
-/// The fold's header is that of the head with the smallest lineage id.
-fn fold_heads(
-    heads: &[RootKinograph],
-    history: &RootHistory,
-) -> (Option<RootKinograph>, BTreeMap<String, Vec<String>>) {
-    let mut disputed: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let Some(first) = heads.iter().min_by(|a, b| a.header.id.cmp(&b.header.id)) else {
-        return (None, disputed);
-    };
-    if heads.len() == 1 {
-        return (Some(first.clone()), disputed);
-    }
-    let base: BTreeMap<&str, &RootEntry> = history
-        .base
-        .iter()
-        .flat_map(|b| b.entries.iter().map(|e| (e.id.as_str(), e)))
-        .collect();
-    let ids: BTreeSet<&str> = heads
-        .iter()
-        .flat_map(|h| h.entries.iter().map(|e| e.id.as_str()))
-        .collect();
-    let mut folded_entries = Vec::new();
-    for id in ids {
-        let present: Vec<&RootEntry> = heads
-            .iter()
-            .filter_map(|h| h.entries.iter().find(|e| e.id == id))
-            .collect();
-        if let Some(was) = base.get(id)
-            && present.len() < heads.len()
-            && present.iter().all(|e| e.version == was.version)
-        {
-            // Dropped on one side, untouched on the others.
-            continue;
-        }
-        let mut versions: Vec<&str> = Vec::new();
-        for e in &present {
-            if !versions.contains(&e.version.as_str()) {
-                versions.push(&e.version);
-            }
-        }
-        let pinned: BTreeSet<&str> = present
-            .iter()
-            .filter(|e| e.pin)
-            .map(|e| e.version.as_str())
-            .collect();
-        let winner: Option<&str> = match pinned.len() {
-            0 => versions
-                .iter()
-                .copied()
-                .find(|v| versions.iter().all(|w| history.descends(v, w))),
-            1 => pinned.iter().next().copied(),
-            _ => None,
-        };
-        let Some(winner) = winner else {
-            disputed.insert(
-                id.to_owned(),
-                versions.iter().map(|v| (*v).to_owned()).collect(),
-            );
-            // A placeholder; the check after the build decides.
-            folded_entries.push(present[0].clone());
-            continue;
-        };
-        let mut entry = present
-            .iter()
-            .find(|e| e.version == winner && (e.pin || pinned.is_empty()))
-            .or_else(|| present.iter().find(|e| e.version == winner))
-            .map(|e| (*e).clone())
-            .unwrap_or_else(|| present[0].clone());
-        for e in present.iter().filter(|e| e.version == winner) {
-            for p in &e.parents {
-                if !entry.parents.contains(p) {
-                    entry.parents.push(p.clone());
-                }
-            }
-            entry.pin |= e.pin;
-        }
-        folded_entries.push(entry);
-    }
-    let mut folded = first.clone();
-    folded.entries = folded_entries;
-    (Some(folded), disputed)
-}
-
 fn propagate_pins(root: &mut RootKinograph, prior: Option<&RootKinograph>) {
     let Some(prior) = prior else { return };
     let pinned: BTreeMap<&str, &RootEntry> = prior

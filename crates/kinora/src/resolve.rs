@@ -5,7 +5,7 @@ use std::str::FromStr;
 use crate::event::Event;
 use crate::hash::{Hash, HashParseError};
 use crate::ledger::{Ledger, LedgerError};
-use crate::roots::{root_heads, root_names, RootHistory, RootsError};
+use crate::roots::{fold_heads, root_heads, root_names, RootHistory, RootsError};
 use crate::root::{RootError, RootKinograph};
 use crate::store::{ContentStore, StoreError};
 
@@ -296,10 +296,23 @@ fn ingest_root_kinographs(
     for name_str in &names {
         let heads = root_heads(kinora_root, name_str).map_err(roots_error)?;
         if heads.len() > 1 {
-            // Every root version back to the heads' common base, so a kino
-            // revised on one side reads as the chain it is, not a fork.
+            // Read the heads as the next commit will fold them: kinos only
+            // from the heads, each at the version the fold settles on — and
+            // a disputed kino at every version the heads hold, a fork.
             let history = RootHistory::walk(kinora_root, &heads).map_err(roots_error)?;
-            kinographs.extend(history.walked);
+            let mut priors = Vec::with_capacity(heads.len());
+            for head in &heads {
+                priors.push(RootKinograph::parse(&store.read(head)?)?);
+            }
+            let (folded, disputed) = fold_heads(&priors, &history);
+            if let Some(folded) = folded {
+                kinographs.push(folded);
+            }
+            for prior in priors {
+                let mut forked = prior;
+                forked.entries.retain(|e| disputed.contains_key(&e.id));
+                kinographs.push(forked);
+            }
             continue;
         }
         for root_hash in heads {
