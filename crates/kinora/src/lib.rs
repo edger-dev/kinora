@@ -19,6 +19,7 @@ pub mod render;
 pub mod repack;
 pub mod resolve;
 pub mod root;
+pub mod roots;
 pub mod store;
 pub mod validate;
 pub mod value;

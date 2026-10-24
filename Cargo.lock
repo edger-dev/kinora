@@ -2506,6 +2506,7 @@ dependencies = [
  "gix",
  "jiff",
  "log",
+ "moco-place",
  "rstest",
  "tempfile",
  "thiserror",
@@ -2762,6 +2763,14 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "moco-place"
+version = "0.1.0-dev"
+source = "git+https://github.com/edger-dev/moco?rev=bed7d2c#bed7d2cde2f43efee55e291a4290deee0ca96549"
+dependencies = [
+ "blake3",
 ]
 
 [[package]]

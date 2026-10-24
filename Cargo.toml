@@ -30,6 +30,8 @@ unimplemented = "warn"          # rule: jig::rust::no-todo-committed
 dbg_macro = "warn"              # rule: jig::rust::no-todo-committed
 
 [workspace.dependencies]
+# The byte substrate: places, streams. Framework-free, no facet.
+moco-place = { git = "https://github.com/edger-dev/moco", rev = "bed7d2c" }
 
 # Serialization
 facet = "0.46.0"
