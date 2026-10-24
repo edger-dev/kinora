@@ -54,12 +54,17 @@ fn store(
 }
 
 fn commit(root: &Path) -> Result<(), String> {
+    commit_at(root, "2026-10-24T00:00:01Z", "t")
+}
+
+/// A commit as one machine makes it: its own clock and author.
+fn commit_at(root: &Path, ts: &str, author: &str) -> Result<(), String> {
     commit_all(
         root,
         CommitParams {
-            author: "t".into(),
+            author: author.into(),
             provenance: "test".into(),
-            ts: "2026-10-24T00:00:01Z".into(),
+            ts: ts.into(),
         },
     )
     .map_err(|e| e.to_string())
@@ -270,4 +275,156 @@ fn a_clone_carries_every_head() {
     assert_eq!(root_heads(&dst, "inbox").unwrap().len(), 2);
     assert_eq!(resolves(&dst, "left"), "from a");
     assert_eq!(resolves(&dst, "right"), "from b");
+}
+
+/// A kino revised twice on one branch while the other branch left it alone
+/// is a linear history, not a fork: the fold and resolve both see v3 as the
+/// head.
+#[test]
+fn a_linear_history_across_a_merge_is_not_a_fork() {
+    let (_t, a) = repo();
+    let doc = store(&a, "v1", "doc", None, &[]);
+    commit(&a).unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let b = branch(&a, other.path());
+
+    let v2 = store(&a, "v2", "doc", Some(&doc), &[&doc]);
+    commit(&a).unwrap();
+    store(&a, "v3", "doc", Some(&doc), &[&v2]);
+    commit(&a).unwrap();
+    store(&b, "unrelated", "other", None, &[]);
+    commit(&b).unwrap();
+    merge(&b, &a);
+
+    assert_eq!(resolves(&a, "doc"), "v3", "resolve sees the chain");
+    commit(&a).unwrap();
+    assert_eq!(root_heads(&a, "inbox").unwrap().len(), 1);
+    assert_eq!(resolves(&a, "doc"), "v3");
+    assert_eq!(resolves(&a, "other"), "unrelated");
+}
+
+/// A fork one side extended further without merging is still a fork: the
+/// fold is refused, never resolved by dropping the other side.
+#[test]
+fn a_one_sided_descendant_does_not_settle_a_fork() {
+    let (_t, a) = repo();
+    let doc = store(&a, "v1", "doc", None, &[]);
+    commit(&a).unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let b = branch(&a, other.path());
+
+    store(&a, "v2a", "doc", Some(&doc), &[&doc]);
+    commit(&a).unwrap();
+    let v2b = store(&b, "v2b", "doc", Some(&doc), &[&doc]);
+    commit(&b).unwrap();
+    store(&b, "v3b", "doc", Some(&doc), &[&v2b]);
+    merge(&b, &a);
+
+    let err = commit(&a).unwrap_err();
+    assert!(err.contains(&doc.event.id), "{err}");
+}
+
+/// Three heads, one of which extends only one side of a fork: refused,
+/// whatever order the heads come in.
+#[test]
+fn three_heads_with_a_fork_are_refused() {
+    let (_t, a) = repo();
+    let doc = store(&a, "v1", "doc", None, &[]);
+    commit(&a).unwrap();
+    let (ob, oc) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let b = branch(&a, ob.path());
+    let c = branch(&a, oc.path());
+
+    let v2a = store(&a, "v2a", "doc", Some(&doc), &[&doc]);
+    commit(&a).unwrap();
+    store(&b, "v2b", "doc", Some(&doc), &[&doc]);
+    commit(&b).unwrap();
+    // C has seen A's v2a and extends it.
+    merge(&a, &c);
+    store(&c, "v3", "doc", Some(&doc), &[&v2a]);
+    commit(&c).unwrap();
+
+    merge(&b, &a);
+    merge(&c, &a);
+    let err = commit(&a).unwrap_err();
+    assert!(err.contains(&doc.event.id), "{err}");
+}
+
+/// A kino moved out of the inbox on one branch stays moved after a merge
+/// with a branch that only touched the inbox otherwise.
+#[test]
+fn a_move_out_of_a_root_survives_a_merge() {
+    let (_t, a) = repo();
+    let cfg = kinora::paths::config_path(&a);
+    let mut config = kinora::config::Config::from_styx(&fs::read_to_string(&cfg).unwrap()).unwrap();
+    config
+        .roots
+        .insert("main".into(), kinora::config::RootPolicy::Never);
+    fs::write(&cfg, config.to_styx().unwrap()).unwrap();
+    let doc = store(&a, "moving", "doc", None, &[]);
+    commit(&a).unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let b = branch(&a, other.path());
+
+    // Triage: a revision, and the move.
+    store(&a, "moved", "doc", Some(&doc), &[&doc]);
+    kinora::assign::write_assign(
+        &a,
+        &kinora::assign::AssignEvent {
+            kino_id: doc.event.id.clone(),
+            target_root: "main".into(),
+            supersedes: vec![],
+            author: "t".into(),
+            ts: "2026-10-24T00:00:03Z".into(),
+            provenance: "test".into(),
+        },
+    )
+    .unwrap();
+    commit(&a).unwrap();
+    store(&b, "unrelated", "other", None, &[]);
+    commit(&b).unwrap();
+    merge(&b, &a);
+    commit(&a).unwrap();
+
+    let ids = |root: &str| -> Vec<String> {
+        let mut ids = Vec::new();
+        for head in root_heads(&a, root).unwrap() {
+            let bytes = kinora::store::ContentStore::new(&a).read(&head).unwrap();
+            let kg = kinora::root::RootKinograph::parse(&bytes).unwrap();
+            ids.extend(kg.entries.into_iter().map(|e| e.id));
+        }
+        ids
+    };
+    assert!(ids("main").contains(&doc.event.id));
+    assert!(
+        !ids("inbox").contains(&doc.event.id),
+        "moved, not copied back"
+    );
+    assert_eq!(resolves(&a, "other"), "unrelated");
+}
+
+/// Two machines folding the same heads write the same version: their fold
+/// commits do not fork again.
+#[test]
+fn two_machines_folding_the_same_heads_agree() {
+    let (_t, a) = repo();
+    store(&a, "base", "base", None, &[]);
+    commit(&a).unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let b = branch(&a, other.path());
+    store(&a, "from a", "left", None, &[]);
+    commit(&a).unwrap();
+    store(&b, "from b", "right", None, &[]);
+    commit(&b).unwrap();
+    merge(&b, &a);
+    merge(&a, &b);
+
+    commit_at(&a, "2026-10-24T09:00:00Z", "laptop").unwrap();
+    commit_at(&b, "2026-10-24T09:00:07Z", "phone").unwrap();
+    merge(&b, &a);
+    assert_eq!(
+        root_heads(&a, "inbox").unwrap().len(),
+        1,
+        "the two folds are one version"
+    );
 }
