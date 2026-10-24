@@ -363,11 +363,13 @@ impl ExternalRefs {
 /// could escape the dir — block it defensively even though the CLI layer
 /// ought to hand us well-formed input.
 pub fn validate_root_name(name: &str) -> Result<(), CommitError> {
+    // A root's versions are a stream named after it: plain characters, no
+    // leading dot (dot-names are the ledger's own).
     if name.is_empty()
-        || name == "."
-        || name == ".."
-        || name.contains('/')
-        || name.contains('\\')
+        || name.starts_with('.')
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
     {
         return Err(CommitError::InvalidRootName { name: name.to_owned() });
     }
@@ -1798,6 +1800,17 @@ mod tests {
         fs::write(root_pointer_path(&root, "inbox"), format!("{hash}\n")).unwrap();
         let got = read_root_pointer(&root, "inbox").unwrap().unwrap();
         assert_eq!(got.as_hex(), hash);
+    }
+
+    /// A root's name is a stream name: plain characters, no leading dot.
+    #[test]
+    fn a_root_name_a_stream_cannot_hold_is_rejected() {
+        for bad in ["my notes", ".hidden", "inbox~b", "naïve"] {
+            assert!(validate_root_name(bad).is_err(), "{bad:?}");
+        }
+        for good in ["inbox", "specs", "kudo-tasks", "v1.2"] {
+            assert!(validate_root_name(good).is_ok(), "{good:?}");
+        }
     }
 
     #[test]

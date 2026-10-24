@@ -2768,7 +2768,7 @@ dependencies = [
 [[package]]
 name = "moco-place"
 version = "0.1.0-dev"
-source = "git+https://github.com/edger-dev/moco?rev=bed7d2c#bed7d2cde2f43efee55e291a4290deee0ca96549"
+source = "git+https://github.com/edger-dev/moco?rev=4117c76#4117c764916b0b25b3276c2ffaa194598578a8ea"
 dependencies = [
  "blake3",
 ]

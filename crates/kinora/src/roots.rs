@@ -14,13 +14,13 @@
 //! implements: 02be1c37832e1c710030e7bc5a89441b55bdbf5a05ebe2c501f824708b7f3372@02be1c37832e1c710030e7bc5a89441b55bdbf5a05ebe2c501f824708b7f3372
 //! task: a1bac9ab38a30da7fd5d5dde31176490b567a3a9625d4eb119649175bac7e9b6@90d573a7ed7cedc54296d959ee6c4a67ad6d471804cf1397a361652155ab4987
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use moco_place::{FsPlace, Key, Stream};
+use moco_place::{FsPlace, Key, Stream, read_all};
 
 use crate::hash::Hash;
 use crate::paths::{root_pointer_path, roots_dir};
@@ -29,6 +29,8 @@ use crate::store::{ContentStore, StoreError};
 
 /// Root versions are root kinographs in the styxl format.
 const EXT: &str = "styxl";
+/// An interrupted migration's pointer copy: `.<name>.legacy`.
+const ASIDE: &str = ".legacy";
 
 /// Why a root's versions could not be read or written.
 #[derive(Debug, thiserror::Error)]
@@ -46,7 +48,8 @@ pub enum RootsError {
 }
 
 /// Every root with committed versions, sorted: streams and legacy pointers
-/// (an interrupted migration's aside copy included).
+/// (an interrupted migration's aside copy, and git's conflict copies
+/// `<name>~<branch>`, counted under their root).
 pub fn root_names(kinora_root: &Path) -> Result<Vec<String>, RootsError> {
     let entries = match fs::read_dir(roots_dir(kinora_root)) {
         Ok(entries) => entries,
@@ -60,76 +63,164 @@ pub fn root_names(kinora_root: &Path) -> Result<Vec<String>, RootsError> {
             continue;
         };
         if let Some(rest) = name.strip_prefix('.') {
-            if let Some(aside) = rest.strip_suffix(".legacy") {
+            if let Some(aside) = rest.strip_suffix(ASIDE) {
                 names.insert(aside.to_owned());
             }
             continue;
         }
         let kind = entry.file_type()?;
-        if kind.is_dir() || kind.is_file() {
-            names.insert(name);
+        if !(kind.is_dir() || kind.is_file()) {
+            continue;
+        }
+        match name.split_once('~') {
+            Some((root, _)) if kind.is_file() && !root.is_empty() => {
+                names.insert(root.to_owned());
+            }
+            Some(_) => {}
+            None => {
+                names.insert(name);
+            }
         }
     }
     Ok(names.into_iter().collect())
 }
 
-/// A root's current versions, oldest first: one normally, several after
-/// concurrent commits, none before the first commit.
+/// A root's current versions: the stream's heads, then any legacy pointer's
+/// version the stream neither holds nor supersedes. One normally, several
+/// after concurrent commits, none before the first commit. Reading writes
+/// nothing.
 pub fn root_heads(kinora_root: &Path, name: &str) -> Result<Vec<Hash>, RootsError> {
-    let pointer = root_pointer_path(kinora_root, name);
-    if pointer.is_dir() {
-        let place = FsPlace::create(kinora_root)?;
-        let heads: Vec<Hash> = stream_for(name)?
-            .heads(&place, &parents_of)?
-            .into_iter()
-            .map(|e| e.hash)
-            .collect();
-        if !heads.is_empty() {
-            return Ok(heads);
+    // Every version heard of — the stream's entries, then the legacy
+    // pointers' — with the parents each names.
+    let mut candidates: Vec<Hash> = Vec::new();
+    let mut superseded: HashSet<Hash> = HashSet::new();
+    if root_pointer_path(kinora_root, name).is_dir() {
+        let place = place(kinora_root);
+        for entry in stream_for(name)?.entries(&place)? {
+            superseded.extend(parents_of(&read_all(&place, &entry.key)?));
+            candidates.push(entry.hash);
         }
-    } else if pointer.is_file() {
-        return Ok(vec![read_pointer(&pointer)?]);
     }
-    let aside = aside_path(kinora_root, name);
-    if aside.is_file() {
-        return Ok(vec![read_pointer(&aside)?]);
+    let store = ContentStore::new(kinora_root);
+    for path in legacy_pointers(kinora_root, name)? {
+        let hash = read_pointer(&path)?;
+        // A legacy version missing from the store is still a head: nothing
+        // is known to supersede it.
+        if let Ok(bytes) = store.read(&hash) {
+            superseded.extend(parents_of(&bytes));
+        }
+        candidates.push(hash);
     }
-    Ok(Vec::new())
+    let mut heads: Vec<Hash> = Vec::new();
+    for hash in candidates {
+        if !superseded.contains(&hash) {
+            heads.retain(|h| h != &hash);
+            heads.push(hash);
+        }
+    }
+    Ok(heads)
 }
 
 /// Append `bytes` (a root kinograph) as the root's newest version, migrating
-/// a legacy pointer first; the version's hash.
+/// legacy pointers first; the version's hash.
 pub fn append_root_version(
     kinora_root: &Path,
     name: &str,
     bytes: &[u8],
 ) -> Result<Hash, RootsError> {
     migrate_root(kinora_root, name)?;
-    let place = FsPlace::create(kinora_root)?;
-    Ok(stream_for(name)?.append(&place, bytes)?.hash)
+    Ok(stream_for(name)?.append(&place(kinora_root), bytes)?.hash)
 }
 
-/// Move a legacy pointer onto the stream; whether there was one to move.
-/// Renamed aside first, so a crash at any point leaves the version readable.
+/// Move a root's legacy pointers onto its stream — the pointer file (renamed
+/// aside first, so a crash at any point leaves the version readable), an
+/// earlier aside copy, git's conflict copies; whether there was any.
 pub fn migrate_root(kinora_root: &Path, name: &str) -> Result<bool, RootsError> {
     let stream = stream_for(name)?;
     let pointer = root_pointer_path(kinora_root, name);
     let aside = aside_path(kinora_root, name);
+    let mut moved = false;
+    // An earlier aside first, so renaming the pointer cannot overwrite it.
+    if aside.is_file() {
+        stream_pointer(kinora_root, &stream, &aside)?;
+        moved = true;
+    }
     if pointer.is_file() {
-        fs::rename(&pointer, &aside)?;
+        match fs::rename(&pointer, &aside) {
+            Ok(()) => {
+                stream_pointer(kinora_root, &stream, &aside)?;
+                moved = true;
+            }
+            // Another commit on this machine moved it first.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
     }
-    if !aside.is_file() {
-        return Ok(false);
+    for stray in conflict_copies(kinora_root, name)? {
+        stream_pointer(kinora_root, &stream, &stray)?;
+        moved = true;
     }
-    let hash = read_pointer(&aside)?;
-    let place = FsPlace::create(kinora_root)?;
-    // A migration resumed after its append already landed adds nothing.
+    Ok(moved)
+}
+
+/// Stream the version a pointer file names (unless the stream holds it),
+/// then remove the file.
+fn stream_pointer(kinora_root: &Path, stream: &Stream, path: &Path) -> Result<(), RootsError> {
+    let hash = read_pointer(path)?;
+    let place = place(kinora_root);
     if !stream.entries(&place)?.iter().any(|e| e.hash == hash) {
         let bytes = ContentStore::new(kinora_root).read(&hash)?;
         stream.append(&place, &bytes)?;
     }
-    fs::remove_file(&aside)?;
-    Ok(true)
+    match fs::remove_file(path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
+    }
+}
+
+/// The legacy pointer files of a root: the pointer itself, an aside copy,
+/// git's conflict copies.
+fn legacy_pointers(kinora_root: &Path, name: &str) -> Result<Vec<PathBuf>, RootsError> {
+    let mut paths = Vec::new();
+    let pointer = root_pointer_path(kinora_root, name);
+    if pointer.is_file() {
+        paths.push(pointer);
+    }
+    let aside = aside_path(kinora_root, name);
+    if aside.is_file() {
+        paths.push(aside);
+    }
+    paths.extend(conflict_copies(kinora_root, name)?);
+    Ok(paths)
+}
+
+/// `roots/<name>~<anything>` files: what git leaves when one branch turned
+/// the pointer into a stream directory and another rewrote the pointer.
+fn conflict_copies(kinora_root: &Path, name: &str) -> Result<Vec<PathBuf>, RootsError> {
+    let entries = match fs::read_dir(roots_dir(kinora_root)) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let lead = format!("{name}~");
+    let mut copies = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let is_copy = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with(&lead));
+        if is_copy && entry.file_type()?.is_file() {
+            copies.push(entry.path());
+        }
+    }
+    copies.sort();
+    Ok(copies)
+}
+
+/// The ledger as a place: a directory inside a repository, no marker.
+fn place(kinora_root: &Path) -> FsPlace {
+    FsPlace::within(kinora_root)
 }
 
 fn stream_for(name: &str) -> Result<Stream, RootsError> {
@@ -145,7 +236,7 @@ fn stream_for(name: &str) -> Result<Stream, RootsError> {
 }
 
 fn aside_path(kinora_root: &Path, name: &str) -> PathBuf {
-    roots_dir(kinora_root).join(format!(".{name}.legacy"))
+    roots_dir(kinora_root).join(format!(".{name}{ASIDE}"))
 }
 
 fn read_pointer(path: &Path) -> Result<Hash, RootsError> {
@@ -156,9 +247,13 @@ fn read_pointer(path: &Path) -> Result<Hash, RootsError> {
     })
 }
 
-/// A root version's parents, from its header; none if it does not parse.
+/// A root version's parents, from its header line alone; none if it does
+/// not parse (a corrupt entry stays a head, for a human to see).
 fn parents_of(bytes: &[u8]) -> Vec<Hash> {
-    RootKinograph::parse(bytes)
+    let header = bytes.split(|b| *b == b'\n').next().unwrap_or_default();
+    let mut line = header.to_vec();
+    line.push(b'\n');
+    RootKinograph::parse(&line)
         .map(|kg| {
             kg.header
                 .parents
@@ -324,6 +419,75 @@ mod tests {
         assert!(migrate_root(&root, "specs").unwrap());
         assert!(!roots_dir(&root).join(".specs.legacy").exists());
         assert_eq!(root_heads(&root, "specs").unwrap(), vec![old]);
+    }
+
+    /// A git merge where one branch migrated and the other rewrote the
+    /// pointer leaves git's conflict copy `roots/<name>~<branch>`: its
+    /// version is a head of `<name>`, and a migration streams it in.
+    #[test]
+    fn a_merge_conflict_copy_is_a_head_and_migrates() {
+        let (_t, root) = kin();
+        let base = append_root_version(&root, "inbox", &version(&[], &["a"])).unwrap();
+        let theirs_bytes = version(&[&base], &["a", "t"]);
+        let theirs = ContentStore::new(&root)
+            .write("root", &theirs_bytes)
+            .unwrap();
+        fs::write(roots_dir(&root).join("inbox~theirs"), theirs.as_hex()).unwrap();
+        assert_eq!(root_names(&root).unwrap(), vec!["inbox".to_owned()]);
+        assert_eq!(root_heads(&root, "inbox").unwrap(), vec![theirs.clone()]);
+        assert!(migrate_root(&root, "inbox").unwrap());
+        assert!(!roots_dir(&root).join("inbox~theirs").exists());
+        assert_eq!(root_heads(&root, "inbox").unwrap(), vec![theirs]);
+    }
+
+    /// An aside copy beside a stream that has heads is still a head, unless
+    /// the stream holds it or supersedes it.
+    #[test]
+    fn an_aside_beside_a_stream_is_still_a_head() {
+        let (_t, root) = kin();
+        let a = append_root_version(&root, "inbox", &version(&[], &["a"])).unwrap();
+        let z = ContentStore::new(&root)
+            .write("root", &version(&[], &["z"]))
+            .unwrap();
+        fs::write(roots_dir(&root).join(".inbox.legacy"), z.as_hex()).unwrap();
+        assert_eq!(
+            root_heads(&root, "inbox").unwrap(),
+            vec![a.clone(), z.clone()]
+        );
+        let fold = append_root_version(&root, "inbox", &version(&[&a, &z], &["a", "z"])).unwrap();
+        assert_eq!(root_heads(&root, "inbox").unwrap(), vec![fold]);
+    }
+
+    /// Reading heads writes nothing into the ledger.
+    #[test]
+    fn reading_writes_nothing() {
+        let (_t, root) = kin();
+        append_root_version(&root, "inbox", &version(&[], &["a"])).unwrap();
+        assert!(
+            !root.join(".moco-place").exists(),
+            "no marker in a repository"
+        );
+        let before: Vec<_> = fs::read_dir(roots_dir(&root).join("inbox"))
+            .unwrap()
+            .collect();
+        root_heads(&root, "inbox").unwrap();
+        root_names(&root).unwrap();
+        let after: Vec<_> = fs::read_dir(roots_dir(&root).join("inbox"))
+            .unwrap()
+            .collect();
+        assert_eq!(before.len(), after.len());
+    }
+
+    /// A migration whose version is missing from the store fails and keeps
+    /// the aside copy, still readable.
+    #[test]
+    fn a_migration_missing_its_version_keeps_the_aside() {
+        let (_t, root) = kin();
+        let ghost = Hash::of_content(b"never stored");
+        fs::create_dir_all(roots_dir(&root)).unwrap();
+        fs::write(root_pointer_path(&root, "specs"), ghost.as_hex()).unwrap();
+        assert!(migrate_root(&root, "specs").is_err());
+        assert_eq!(root_heads(&root, "specs").unwrap(), vec![ghost]);
     }
 
     /// Temporaries and other dot-names are not roots.
