@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 
 use crate::hash::{Hash, HashParseError};
 use crate::namespace::ext_for_kind;
-use crate::paths::{find_blob_path, store_blob_path_with_ext, store_dir};
+use moco_place::{put_bytes, FsPlace, Key};
+
+use crate::paths::{find_blob_path, store_dir, STORE_DIR};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -12,6 +14,8 @@ pub enum StoreError {
     Io(#[from] io::Error),
     #[error("content hash mismatch at {}: expected {expected}, got {got}", .path.display())]
     HashMismatch { expected: Hash, got: Hash, path: PathBuf },
+    #[error("content store place: {0}")]
+    Place(#[from] moco_place::PlaceError),
     #[error("invalid hash in stored path {}: {err}", .path.display())]
     InvalidStoredHash {
         path: PathBuf,
@@ -40,30 +44,22 @@ impl ContentStore {
     /// is written and the existing path stands. Extensions are advisory UX
     /// — the authoritative `kind` lives in the ledger event.
     ///
-    /// Tmp path is prefixed (`.tmp-<hash>.<ext>`) so a crashed write never
-    /// masquerades as a real blob when [`find_blob_path`] scans the shard
-    /// dir — the stem-is-hash invariant of on-disk blobs is preserved.
+    /// Written through the ledger's place (moco's put-once: a temporary
+    /// created exclusively, checked against the hash, then linked into
+    /// place), so a crashed write never masquerades as a real blob and two
+    /// writers never clobber each other.
     pub fn write(&self, kind: &str, content: &[u8]) -> Result<Hash, StoreError> {
         let hash = Hash::of_content(content);
         if find_blob_path(&self.kinora_root, &hash).is_some() {
             return Ok(hash);
         }
-        let ext = ext_for_kind(kind);
-        let path = store_blob_path_with_ext(&self.kinora_root, &hash, ext);
-        let parent = path.parent().ok_or_else(|| {
-            StoreError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("blob path has no parent dir: {}", path.display()),
-            ))
-        })?;
-        fs::create_dir_all(parent)?;
-        let tmp_name = match ext {
-            Some(e) => format!(".tmp-{}.{e}", hash.as_hex()),
-            None => format!(".tmp-{}", hash.as_hex()),
+        let name = match ext_for_kind(kind) {
+            Some(ext) => format!("{}.{ext}", hash.as_hex()),
+            None => hash.as_hex().to_owned(),
         };
-        let tmp = parent.join(tmp_name);
-        fs::write(&tmp, content)?;
-        fs::rename(&tmp, &path)?;
+        let key = Key::new(format!("{STORE_DIR}/{}/{name}", hash.shard()))
+            .map_err(|e| StoreError::Io(io::Error::new(io::ErrorKind::InvalidInput, e)))?;
+        put_bytes(&FsPlace::within(&self.kinora_root), &key, content)?;
         Ok(hash)
     }
 
