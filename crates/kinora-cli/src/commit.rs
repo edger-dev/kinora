@@ -253,8 +253,8 @@ mod tests {
         let names: Vec<_> = report.per_root.iter().map(|(n, _)| n.clone()).collect();
         assert_eq!(names, vec!["inbox", "main", "rfcs", "commits"]);
         assert!(!report.any_error(), "expected all roots to succeed: {names:?}");
-        assert!(kinora::paths::root_pointer_path(&kin, "main").is_file());
-        assert!(kinora::paths::root_pointer_path(&kin, "rfcs").is_file());
+        assert!(kinora::paths::root_pointer_path(&kin, "main").is_dir());
+        assert!(kinora::paths::root_pointer_path(&kin, "rfcs").is_dir());
     }
 
     #[test]

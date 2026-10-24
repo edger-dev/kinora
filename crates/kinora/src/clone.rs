@@ -27,7 +27,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use crate::commit::{read_root_pointer, CommitError};
+use crate::commit::{read_root_heads, CommitError};
+use crate::roots::{append_root_version, RootsError};
 use crate::config::{Config, ConfigError};
 use crate::event::{Event, EventError};
 use crate::hash::{Hash, HashParseError};
@@ -35,7 +36,7 @@ use crate::kinograph::{Kinograph, KinographError};
 use crate::ledger::{Ledger, LedgerError};
 use crate::namespace::ext_for_kind;
 use crate::paths::{
-    config_path, find_blob_path, root_pointer_path, roots_dir, staged_dir, store_dir,
+    config_path, find_blob_path, roots_dir, staged_dir, store_dir,
 };
 use crate::root::{RootError, RootKinograph};
 use crate::store::{ContentStore, StoreError};
@@ -58,6 +59,8 @@ pub enum CloneError {
     Event(#[from] EventError),
     #[error(transparent)]
     Commit(#[from] CommitError),
+    #[error(transparent)]
+    Roots(#[from] RootsError),
     #[error("invalid hash `{value}`: {err}")]
     InvalidHash {
         value: String,
@@ -134,10 +137,15 @@ pub fn clone_repo(
     let mut id_queue: Vec<String> = Vec::new();
     let mut visited_ids: HashSet<String> = HashSet::new();
 
+    // Every head: a root forked by concurrent commits keeps all of them.
+    let mut heads: Vec<(String, Hash)> = Vec::new();
     for root_name in config.roots.keys() {
-        let Some(root_hash) = read_root_pointer(src, root_name)? else {
-            continue;
-        };
+        for head in read_root_heads(src, root_name)? {
+            heads.push((root_name.clone(), head));
+        }
+    }
+    for (_, root_hash) in &heads {
+        let root_hash = root_hash.clone();
         let hex = root_hash.as_hex().to_owned();
         reachable_blobs.insert(hex.clone());
         reachable_kinds.insert(hex, "root".to_owned());
@@ -228,10 +236,11 @@ pub fn clone_repo(
 
     report.blobs_dropped = src_blobs.len().saturating_sub(reachable_blobs.len());
 
-    for root_name in config.roots.keys() {
-        if let Some(hash) = read_root_pointer(src, root_name)? {
-            write_root_pointer(dst, root_name, &hash)?;
-        }
+    // Each head becomes an entry of the root's stream in the clone, oldest
+    // first; none names another, so all stay heads.
+    for (root_name, hash) in &heads {
+        let bytes = dst_store.read(hash)?;
+        append_root_version(dst, root_name, &bytes)?;
     }
 
     let dst_ledger = Ledger::new(dst);
@@ -318,20 +327,6 @@ fn pick_head<'a>(id: &str, events: &'a [Event]) -> Result<&'a Event, CloneError>
             heads: many.iter().map(|e| e.hash.clone()).collect(),
         }),
     }
-}
-
-fn write_root_pointer(
-    kinora_root: &Path,
-    root_name: &str,
-    hash: &Hash,
-) -> Result<(), CloneError> {
-    let dir = roots_dir(kinora_root);
-    fs::create_dir_all(&dir)?;
-    let path = root_pointer_path(kinora_root, root_name);
-    let tmp = dir.join(format!(".{root_name}.tmp"));
-    fs::write(&tmp, hash.as_hex())?;
-    fs::rename(&tmp, &path)?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -502,8 +497,8 @@ mod tests {
         );
 
         // inbox root pointer copied
-        let src_ptr = read_root_pointer(&src, "inbox").unwrap().unwrap();
-        let dst_ptr = read_root_pointer(&dst, "inbox").unwrap().unwrap();
+        let src_ptr = crate::commit::read_root_pointer(&src, "inbox").unwrap().unwrap();
+        let dst_ptr = crate::commit::read_root_pointer(&dst, "inbox").unwrap().unwrap();
         assert_eq!(src_ptr.as_hex(), dst_ptr.as_hex());
         assert!(
             ContentStore::new(&dst).exists(&src_ptr),

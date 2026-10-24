@@ -5,7 +5,7 @@ use std::str::FromStr;
 use crate::event::Event;
 use crate::hash::{Hash, HashParseError};
 use crate::ledger::{Ledger, LedgerError};
-use crate::paths::{root_pointer_path, roots_dir};
+use crate::roots::{root_heads, root_names, RootsError};
 use crate::root::{RootError, RootKinograph};
 use crate::store::{ContentStore, StoreError};
 
@@ -19,6 +19,8 @@ pub enum ResolveError {
     Root(#[from] RootError),
     #[error(transparent)]
     Io(#[from] io::Error),
+    #[error("root versions: {0}")]
+    Roots(String),
     #[error("root pointer at {path} is not a valid hash: {body:?}")]
     InvalidRootPointer { path: std::path::PathBuf, body: String },
     #[error("invalid hash `{value}`: {err}")]
@@ -269,13 +271,6 @@ fn ingest_root_kinographs(
     kinora_root: &std::path::Path,
     by_id: &mut BTreeMap<String, Vec<(String, Event)>>,
 ) -> Result<(), ResolveError> {
-    let roots_path = roots_dir(kinora_root);
-    let dir_iter = match std::fs::read_dir(&roots_path) {
-        Ok(it) => it,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e.into()),
-    };
-
     // (id, version) pairs already carried by authentic staged events; root
     // entries for these are skipped entirely (staged wins).
     let staged_pairs: HashSet<(String, String)> = by_id
@@ -283,23 +278,9 @@ fn ingest_root_kinographs(
         .flat_map(|(_, events)| events.iter().map(|(_, e)| (e.id.clone(), e.hash.clone())))
         .collect();
 
-    // Collect and sort root pointer names for deterministic iteration.
-    let mut names: Vec<String> = Vec::new();
-    for entry in dir_iter {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
-            continue;
-        }
-        let Some(name_str) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        // Skip `.<name>.tmp` atomic-rename sidecars.
-        if name_str.starts_with('.') {
-            continue;
-        }
-        names.push(name_str);
-    }
-    names.sort();
+    // Every root with committed versions — streams and legacy pointers,
+    // sorted for deterministic iteration.
+    let names = root_names(kinora_root).map_err(roots_error)?;
 
     // Location of each synthesized (id, version) within `by_id`, so a later
     // root listing the same pair can union its parents into the existing
@@ -307,12 +288,18 @@ fn ingest_root_kinographs(
     let mut synth_loc: HashMap<(String, String), usize> = HashMap::new();
 
     let store = ContentStore::new(kinora_root);
-    for name_str in names {
-        let Some(root_hash) = read_root_pointer_local(kinora_root, &name_str)? else {
-            continue;
-        };
-        let bytes = store.read(&root_hash)?;
-        let kg = RootKinograph::parse(&bytes)?;
+    // Every head of every root: concurrent commits leave several until the
+    // next commit folds them. Their entries meet here like any roots' do —
+    // a pair listed twice unions its parents, two versions of one kino are
+    // a fork the head detection reports.
+    let mut kinographs = Vec::new();
+    for name_str in &names {
+        for root_hash in root_heads(kinora_root, name_str).map_err(roots_error)? {
+            let bytes = store.read(&root_hash)?;
+            kinographs.push(RootKinograph::parse(&bytes)?);
+        }
+    }
+    for kg in kinographs {
         for re in kg.entries {
             let key = (re.id.clone(), re.version.clone());
             if staged_pairs.contains(&key) {
@@ -353,27 +340,12 @@ fn ingest_root_kinographs(
     Ok(())
 }
 
-/// Read a root pointer file for the kinograph pass. Mirrors the logic in
-/// `commit::read_root_pointer`, inlined here to avoid a type cycle between
-/// `ResolveError` and `CommitError` (via `KinographError`).
-fn read_root_pointer_local(
-    kinora_root: &std::path::Path,
-    root_name: &str,
-) -> Result<Option<Hash>, ResolveError> {
-    let path = root_pointer_path(kinora_root, root_name);
-    match std::fs::read_to_string(&path) {
-        Ok(body) => {
-            let trimmed = body.trim_end_matches(['\r', '\n']);
-            let hash = Hash::from_str(trimmed).map_err(|_| {
-                ResolveError::InvalidRootPointer {
-                    path: path.clone(),
-                    body: body.clone(),
-                }
-            })?;
-            Ok(Some(hash))
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
+/// A roots failure as a resolve error: a bad pointer keeps its own variant.
+fn roots_error(e: RootsError) -> ResolveError {
+    match e {
+        RootsError::InvalidPointer { path, body } => ResolveError::InvalidRootPointer { path, body },
+        RootsError::Io(e) => ResolveError::Io(e),
+        other => ResolveError::Roots(other.to_string()),
     }
 }
 

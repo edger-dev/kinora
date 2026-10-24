@@ -33,7 +33,8 @@ use crate::hash::{Hash, HashParseError};
 use crate::kino::{store_kino, StoreKinoError, StoreKinoParams};
 use crate::kinograph::{Kinograph, KinographError};
 use crate::ledger::{Ledger, LedgerError};
-use crate::paths::{config_path, staged_event_path, root_pointer_path, roots_dir};
+use crate::paths::{config_path, staged_event_path};
+use crate::roots::{append_root_version, root_heads, RootsError};
 use crate::root::{RootEntry, RootError, RootKinograph};
 use crate::store::{ContentStore, StoreError};
 
@@ -106,6 +107,25 @@ pub enum CommitError {
     /// config/user error that must be fixed globally.
     #[error("unknown root `{name}` referenced by assign event {event_hash}")]
     UnknownRoot { name: String, event_hash: String },
+    #[error(transparent)]
+    Roots(RootsError),
+    /// Concurrent commits left heads that disagree on a kino the fresh
+    /// build does not settle: a fork. Merge each kino (a version naming
+    /// every listed version as a parent) and commit again.
+    #[error(
+        "root {root} has heads that disagree on {}: merge each (kinora store … --parents <a>,<b>) and commit again",
+        .kinos.iter().map(|(id, versions)| format!("{id} ({})", versions.join(", "))).collect::<Vec<_>>().join("; ")
+    )]
+    ForkedRoot { root: String, kinos: Vec<(String, Vec<String>)> },
+}
+
+impl From<RootsError> for CommitError {
+    fn from(e: RootsError) -> Self {
+        match e {
+            RootsError::InvalidPointer { path, body } => Self::InvalidPointer { path, body },
+            other => Self::Roots(other),
+        }
+    }
 }
 
 /// Inputs for a commit call. Mirrors the parts of `StoreKinoParams` that
@@ -184,112 +204,115 @@ impl ExternalRefs {
         }
 
         for source_root in declared_roots {
-            let root_ptr = match read_root_pointer(kinora_root, source_root) {
-                Ok(Some(h)) => h,
-                Ok(None) => continue,
+            // Every head: concurrent commits leave several until the next
+            // commit folds them, and each may hold references.
+            let heads = match read_root_heads(kinora_root, source_root) {
+                Ok(heads) => heads,
                 Err(e) => {
                     log::debug!(
                         target: "kinora::commit::refs",
                         source_root = source_root.as_str(),
                         error:% = e;
-                        "skip root: unreadable pointer",
+                        "skip root: unreadable versions",
                     );
                     continue;
                 }
             };
-            let root_bytes = match store.read(&root_ptr) {
-                Ok(b) => b,
-                Err(e) => {
-                    log::debug!(
-                        target: "kinora::commit::refs",
-                        source_root = source_root.as_str(),
-                        root_hash = root_ptr.as_hex(),
-                        error:% = e;
-                        "skip root: missing root blob",
-                    );
-                    continue;
-                }
-            };
-            let root_kg = match RootKinograph::parse(&root_bytes) {
-                Ok(k) => k,
-                Err(e) => {
-                    log::debug!(
-                        target: "kinora::commit::refs",
-                        source_root = source_root.as_str(),
-                        root_hash = root_ptr.as_hex(),
-                        error:% = e;
-                        "skip root: root blob did not parse",
-                    );
-                    continue;
-                }
-            };
-            for entry in &root_kg.entries {
-                if entry.kind != "kinograph" {
-                    continue;
-                }
-                let version_hash = match Hash::from_str(&entry.version) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        log::debug!(
-                            target: "kinora::commit::refs",
-                            source_root = source_root.as_str(),
-                            version = entry.version.as_str(),
-                            error:% = e;
-                            "skip entry: invalid version hash",
-                        );
-                        continue;
-                    }
-                };
-                let kg_bytes = match store.read(&version_hash) {
+            for root_ptr in heads {
+                let root_bytes = match store.read(&root_ptr) {
                     Ok(b) => b,
                     Err(e) => {
                         log::debug!(
                             target: "kinora::commit::refs",
                             source_root = source_root.as_str(),
-                            version = entry.version.as_str(),
+                            root_hash = root_ptr.as_hex(),
                             error:% = e;
-                            "skip entry: missing kinograph blob",
+                            "skip root: missing root blob",
                         );
                         continue;
                     }
                 };
-                let kg = match Kinograph::parse(&kg_bytes) {
+                let root_kg = match RootKinograph::parse(&root_bytes) {
                     Ok(k) => k,
                     Err(e) => {
                         log::debug!(
                             target: "kinora::commit::refs",
                             source_root = source_root.as_str(),
-                            version = entry.version.as_str(),
+                            root_hash = root_ptr.as_hex(),
                             error:% = e;
-                            "skip entry: kinograph did not parse",
+                            "skip root: root blob did not parse",
                         );
                         continue;
                     }
                 };
-                for comp in &kg.entries {
-                    let target_version = if !comp.pin.is_empty() {
-                        comp.pin.clone()
-                    } else {
-                        let Some(group) = events_by_id.get(&comp.id) else {
+                for entry in &root_kg.entries {
+                    if entry.kind != "kinograph" {
+                        continue;
+                    }
+                    let version_hash = match Hash::from_str(&entry.version) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            log::debug!(
+                                target: "kinora::commit::refs",
+                                source_root = source_root.as_str(),
+                                version = entry.version.as_str(),
+                                error:% = e;
+                                "skip entry: invalid version hash",
+                            );
                             continue;
-                        };
-                        match pick_head(&comp.id, group) {
-                            Ok(head) => head.hash.clone(),
-                            Err(e) => {
-                                log::debug!(
-                                    target: "kinora::commit::refs",
-                                    source_root = source_root.as_str(),
-                                    kino_id = comp.id.as_str(),
-                                    error:% = e;
-                                    "skip comp: head pick failed",
-                                );
-                                continue;
-                            }
                         }
                     };
-                    out.entry((comp.id.clone(), target_version))
-                        .or_default()
-                        .insert(source_root.clone());
+                    let kg_bytes = match store.read(&version_hash) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            log::debug!(
+                                target: "kinora::commit::refs",
+                                source_root = source_root.as_str(),
+                                version = entry.version.as_str(),
+                                error:% = e;
+                                "skip entry: missing kinograph blob",
+                            );
+                            continue;
+                        }
+                    };
+                    let kg = match Kinograph::parse(&kg_bytes) {
+                        Ok(k) => k,
+                        Err(e) => {
+                            log::debug!(
+                                target: "kinora::commit::refs",
+                                source_root = source_root.as_str(),
+                                version = entry.version.as_str(),
+                                error:% = e;
+                                "skip entry: kinograph did not parse",
+                            );
+                            continue;
+                        }
+                    };
+                    for comp in &kg.entries {
+                        let target_version = if !comp.pin.is_empty() {
+                            comp.pin.clone()
+                        } else {
+                            let Some(group) = events_by_id.get(&comp.id) else {
+                                continue;
+                            };
+                            match pick_head(&comp.id, group) {
+                                Ok(head) => head.hash.clone(),
+                                Err(e) => {
+                                    log::debug!(
+                                        target: "kinora::commit::refs",
+                                        source_root = source_root.as_str(),
+                                        kino_id = comp.id.as_str(),
+                                        error:% = e;
+                                        "skip comp: head pick failed",
+                                    );
+                                    continue;
+                                }
+                            }
+                        };
+                        out.entry((comp.id.clone(), target_version))
+                            .or_default()
+                            .insert(source_root.clone());
+                    }
                 }
             }
         }
@@ -351,44 +374,21 @@ pub fn validate_root_name(name: &str) -> Result<(), CommitError> {
     Ok(())
 }
 
-/// Read the current root pointer file. Returns `None` when the file does
-/// not yet exist (no commit has happened for this root). The body is
-/// expected to be exactly a 64-hex hash with no trailing whitespace.
+/// A root's newest version — the latest head when concurrent commits left
+/// several (see [`read_root_heads`]). `None` before the first commit.
 pub fn read_root_pointer(
     kinora_root: &Path,
     root_name: &str,
 ) -> Result<Option<Hash>, CommitError> {
-    validate_root_name(root_name)?;
-    let path = root_pointer_path(kinora_root, root_name);
-    match fs::read_to_string(&path) {
-        Ok(body) => {
-            let trimmed = body.trim_end_matches(['\r', '\n']);
-            let hash = Hash::from_str(trimmed).map_err(|_| CommitError::InvalidPointer {
-                path: path.clone(),
-                body,
-            })?;
-            Ok(Some(hash))
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(CommitError::Io(e)),
-    }
+    Ok(read_root_heads(kinora_root, root_name)?.pop())
 }
 
-/// Atomically write `.kinora/roots/<name>` with the given 64-hex hash
-/// (no trailing newline). Uses tmp+rename so a crash mid-write never
-/// leaves a truncated pointer.
-fn write_root_pointer(
-    kinora_root: &Path,
-    root_name: &str,
-    hash: &Hash,
-) -> Result<(), CommitError> {
-    let dir = roots_dir(kinora_root);
-    fs::create_dir_all(&dir)?;
-    let path = root_pointer_path(kinora_root, root_name);
-    let tmp = dir.join(format!(".{root_name}.tmp"));
-    fs::write(&tmp, hash.as_hex())?;
-    fs::rename(&tmp, &path)?;
-    Ok(())
+/// A root's current versions, oldest first: one normally, several after
+/// commits made concurrently (two branches merged), none before the first
+/// commit.
+pub fn read_root_heads(kinora_root: &Path, root_name: &str) -> Result<Vec<Hash>, CommitError> {
+    validate_root_name(root_name)?;
+    Ok(root_heads(kinora_root, root_name)?)
 }
 
 /// Compute the root kinograph that would be produced for `root_name` from
@@ -590,13 +590,12 @@ fn collect_root_ownership(
     let mut owned: BTreeMap<String, String> = BTreeMap::new();
     // BTreeSet already yields sorted names; iterate explicitly for clarity.
     for root_name in declared_roots {
-        let Some(hash) = read_root_pointer(kinora_root, root_name)? else {
-            continue;
-        };
-        let Ok(bytes) = store.read(&hash) else { continue };
-        let Ok(kg) = RootKinograph::parse(&bytes) else { continue };
-        for entry in kg.entries {
-            owned.insert(entry.id, root_name.clone());
+        for hash in read_root_heads(kinora_root, root_name)? {
+            let Ok(bytes) = store.read(&hash) else { continue };
+            let Ok(kg) = RootKinograph::parse(&bytes) else { continue };
+            for entry in kg.entries {
+                owned.insert(entry.id, root_name.clone());
+            }
         }
     }
     Ok(owned)
@@ -678,7 +677,8 @@ fn commit_root_with_refs(
     refs: &ExternalRefs,
 ) -> Result<CommitResult, CommitError> {
     validate_root_name(root_name)?;
-    let prior_version = read_root_pointer(kinora_root, root_name)?;
+    let heads = read_root_heads(kinora_root, root_name)?;
+    let prior_version = heads.last().cloned();
 
     let policy = config
         .roots
@@ -691,12 +691,16 @@ fn commit_root_with_refs(
     // owned by this root — this preserves hand-edits to the pin/version
     // fields across commits. Loaded before `build_root` so the merge
     // step can pick up entries whose store events have been pruned.
-    let prior_root: Option<RootKinograph> = match &prior_version {
-        Some(h) => Some(RootKinograph::parse(
-            &ContentStore::new(kinora_root).read(h)?,
-        )?),
-        None => None,
-    };
+    //
+    // Several heads (concurrent commits) are folded first: their entries
+    // unioned, a kino they disagree on settled by descent where one version
+    // names the other, else left for the check after the build.
+    let store = ContentStore::new(kinora_root);
+    let mut priors = Vec::with_capacity(heads.len());
+    for head in &heads {
+        priors.push(RootKinograph::parse(&store.read(head)?)?);
+    }
+    let (prior_root, disputed) = fold_heads(&priors);
 
     // Never and MaxAge roots get prior-root merge in `build_root`. After
     // archival, Never/MaxAge drain their committed events from staging —
@@ -710,6 +714,25 @@ fn commit_root_with_refs(
         .flatten();
     let mut root = build_root(events, root_name, declared_roots, owned, merge_source)?;
     propagate_pins(&mut root, prior_root.as_ref());
+
+    // A disputed kino is settled when the fresh build carries a version
+    // other than the disputed ones (a merge stored since). Otherwise the
+    // heads fork on it, and nothing here may pick a side.
+    let unsettled: Vec<(String, Vec<String>)> = disputed
+        .into_iter()
+        .filter(|(id, versions)| {
+            root.entries
+                .iter()
+                .find(|e| &e.id == id)
+                .is_some_and(|e| versions.contains(&e.version))
+        })
+        .collect();
+    if !unsettled.is_empty() {
+        return Err(CommitError::ForkedRoot {
+            root: root_name.to_owned(),
+            kinos: unsettled,
+        });
+    }
 
     let implicit_pinned = refs.implicit_pinned_versions(root_name);
 
@@ -733,9 +756,9 @@ fn commit_root_with_refs(
     // record the prior blob hash as the parent.
     let fresh_entries = std::mem::take(&mut root.entries);
     let root = match (prior_root.as_ref(), prior_version.as_ref()) {
-        (Some(prior), Some(prior_hash)) => RootKinograph::new_child(
+        (Some(prior), Some(_)) => RootKinograph::new_child(
             prior.header.id.clone(),
-            vec![prior_hash.as_hex().to_owned()],
+            heads.iter().map(|h| h.as_hex().to_owned()).collect(),
             fresh_entries,
             params.ts.clone(),
             params.author.clone(),
@@ -752,10 +775,12 @@ fn commit_root_with_refs(
     // No-op detection: compare entries, not bytes. The header carries ts
     // which changes every commit, so byte-identity would never match
     // across two clean runs.
-    let entries_unchanged = match prior_root.as_ref() {
-        Some(p) => p.entries == root.entries,
-        None => root.entries.is_empty(),
-    };
+    // Several heads always commit: the fold itself is the change.
+    let entries_unchanged = heads.len() <= 1
+        && match prior_root.as_ref() {
+            Some(p) => p.entries == root.entries,
+            None => root.entries.is_empty(),
+        };
 
     let result = if entries_unchanged {
         CommitResult {
@@ -767,7 +792,7 @@ fn commit_root_with_refs(
     } else {
         let new_bytes = root.to_styxl()?.into_bytes();
         let new_hash = ContentStore::new(kinora_root).write("root", &new_bytes)?;
-        write_root_pointer(kinora_root, root_name, &new_hash)?;
+        append_root_version(kinora_root, root_name, &new_bytes)?;
         CommitResult {
             root_name: root_name.to_owned(),
             new_version: Some(new_hash),
@@ -994,6 +1019,56 @@ fn drop_staged_events(
 /// Ownership wins over pin on cross-root moves: a kino reassigned away
 /// from this root simply won't appear in the rebuild (routing filtered
 /// it out), so its prior pinned entry is silently dropped.
+/// Fold a root's heads into one prior: entries unioned by id. Where heads
+/// disagree on a kino's version, the one naming the other as a parent wins;
+/// failing that, the kino is disputed — returned with every version heard,
+/// for the caller to check against the fresh build. The fold's header is
+/// the first head's (its lineage id), smallest lineage id first.
+fn fold_heads(heads: &[RootKinograph]) -> (Option<RootKinograph>, BTreeMap<String, Vec<String>>) {
+    let mut disputed: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let Some(first) = heads.iter().min_by(|a, b| a.header.id.cmp(&b.header.id)) else {
+        return (None, disputed);
+    };
+    if heads.len() == 1 {
+        return (Some(first.clone()), disputed);
+    }
+    let mut by_id: BTreeMap<String, RootEntry> = BTreeMap::new();
+    for head in heads {
+        for entry in &head.entries {
+            match by_id.get(&entry.id) {
+                None => {
+                    by_id.insert(entry.id.clone(), entry.clone());
+                }
+                Some(kept) if kept.version == entry.version => {
+                    let mut merged = kept.clone();
+                    for p in &entry.parents {
+                        if !merged.parents.contains(p) {
+                            merged.parents.push(p.clone());
+                        }
+                    }
+                    merged.pin |= entry.pin;
+                    by_id.insert(entry.id.clone(), merged);
+                }
+                Some(kept) if entry.parents.contains(&kept.version) => {
+                    by_id.insert(entry.id.clone(), entry.clone());
+                }
+                Some(kept) if kept.parents.contains(&entry.version) => {}
+                Some(kept) => {
+                    let versions = disputed.entry(entry.id.clone()).or_default();
+                    for v in [&kept.version, &entry.version] {
+                        if !versions.contains(v) {
+                            versions.push(v.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut folded = first.clone();
+    folded.entries = by_id.into_values().collect();
+    (Some(folded), disputed)
+}
+
 fn propagate_pins(root: &mut RootKinograph, prior: Option<&RootKinograph>) {
     let Some(prior) = prior else { return };
     let pinned: BTreeMap<&str, &RootEntry> = prior
@@ -1369,6 +1444,7 @@ pub fn drain_archived_orphans(kinora_root: &Path) -> Result<usize, CommitError> 
 mod tests {
     use super::*;
     use crate::assign::{AssignEvent, EVENT_KIND_ASSIGN};
+    use crate::paths::{root_pointer_path, roots_dir};
     use crate::commit_archive::parse_archive;
     use crate::init::init;
     use crate::kino::{store_kino, StoreKinoParams};
@@ -1500,7 +1576,7 @@ mod tests {
             .unwrap();
         let first_version = first.new_version.unwrap();
 
-        let pointer_before = fs::read(root_pointer_path(&root, "inbox")).unwrap();
+        let heads_before = read_root_heads(&root, "inbox").unwrap();
 
         // No new user events; different ts on the commit itself.
         let second = commit_root(&root, "inbox", params("yj", "2026-04-19T10:05:00Z"))
@@ -1508,8 +1584,8 @@ mod tests {
         assert!(second.new_version.is_none(), "should be no-op");
         assert_eq!(second.prior_version.unwrap(), first_version);
 
-        let pointer_after = fs::read(root_pointer_path(&root, "inbox")).unwrap();
-        assert_eq!(pointer_before, pointer_after, "pointer unchanged on no-op");
+        let heads_after = read_root_heads(&root, "inbox").unwrap();
+        assert_eq!(heads_before, heads_after, "no version appended on a no-op");
     }
 
     #[test]
@@ -1624,19 +1700,15 @@ mod tests {
     }
 
     #[test]
-    fn pointer_file_is_exactly_64_hex_no_trailing_whitespace() {
+    fn a_commit_appends_its_version_to_the_roots_stream() {
         let (_t, root) = setup();
         store_md(&root, b"x", "x", "2026-04-19T10:00:00Z");
         let result = commit_root(&root, "inbox", params("yj", "2026-04-19T10:00:01Z"))
             .unwrap();
         let hash = result.new_version.unwrap();
-        let pointer = fs::read_to_string(root_pointer_path(&root, "inbox")).unwrap();
-        assert_eq!(
-            pointer,
-            hash.as_hex(),
-            "pointer must be exactly the hash with no trailing whitespace/newline"
-        );
-        assert_eq!(pointer.len(), 64);
+        assert!(roots_dir(&root).join("inbox").is_dir(), "the root is a stream");
+        assert!(!root_pointer_path(&root, "inbox").is_file(), "no pointer file");
+        assert_eq!(read_root_heads(&root, "inbox").unwrap(), vec![hash]);
     }
 
     #[test]
@@ -1903,9 +1975,9 @@ roots {
             by_name["forked"]
         );
 
-        // main pointer advanced to disk despite the sibling failure.
-        assert!(root_pointer_path(&root, "main").is_file());
-        assert!(root_pointer_path(&root, "clean").is_file());
+        // main's version reached disk despite the sibling failure.
+        assert!(root_pointer_path(&root, "main").is_dir());
+        assert!(root_pointer_path(&root, "clean").is_dir());
     }
 
     #[test]
@@ -2312,7 +2384,7 @@ roots {
         );
         let bytes = rk.to_styxl().unwrap().into_bytes();
         let new_hash = ContentStore::new(kin).write("root", &bytes).unwrap();
-        write_root_pointer(kin, root_name, &new_hash).unwrap();
+        crate::roots::append_root_version(kin, root_name, &bytes).unwrap();
         new_hash
     }
 

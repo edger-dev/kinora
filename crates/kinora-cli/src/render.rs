@@ -3,12 +3,12 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use kinora::cache_path::CachePath;
-use kinora::commit::read_root_pointer;
+use kinora::commit::read_root_heads;
 use kinora::config::Config;
 use kinora::git_state::{
     ExtractError, WorktreeInfo, extract_subtree, list_local_branches, list_worktrees,
 };
-use kinora::paths::{config_path, kinora_root, roots_dir};
+use kinora::paths::{config_path, kinora_root};
 use kinora::render::{Book, render, write_book};
 use kinora::resolve::Resolver;
 use kinora::root::RootKinograph;
@@ -301,51 +301,31 @@ fn resolve_cache_root(xdg: Option<&str>, home: Option<&str>) -> Result<PathBuf, 
 /// out — callers should fall back to a default label for them.
 fn build_owners_map(kin_root: &Path) -> Result<HashMap<String, String>, CliError> {
     let mut owners: HashMap<String, String> = HashMap::new();
-    let dir = roots_dir(kin_root);
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(it) => it,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(owners),
-        Err(e) => return Err(CliError::Io(e)),
-    };
-
-    // Collect + sort pointer names so multi-root insertion order is
-    // deterministic. Post-phase-3 ownership is exclusive, so collisions
-    // shouldn't happen — but until then, a stable "last writer wins"
-    // rule keeps render output reproducible across machines.
-    let mut names: Vec<String> = Vec::new();
-    for entry in entries {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
-            continue;
-        }
-        let file_name = entry.file_name();
-        let Some(root_name) = file_name.to_str() else {
-            continue;
-        };
-        // Skip `.<name>.tmp` files `write_root_pointer` creates mid-rename.
-        if root_name.starts_with('.') {
-            continue;
-        }
-        // The `commits` root holds per-commit archive kinos — infrastructure
-        // metadata, not user content. Render consumers (`mdbook` pages)
-        // should not see them; they're surfaced through `kinora log` / a
-        // future dedicated command instead.
-        if root_name == "commits" {
-            continue;
-        }
-        names.push(root_name.to_owned());
-    }
-    names.sort();
+    // Streams and legacy pointers alike, sorted so multi-root insertion
+    // order is deterministic. Post-phase-3 ownership is exclusive, so
+    // collisions shouldn't happen — but until then, a stable "last writer
+    // wins" rule keeps render output reproducible across machines.
+    //
+    // The `commits` root holds per-commit archive kinos — infrastructure
+    // metadata, not user content. Render consumers (`mdbook` pages) should
+    // not see them; they're surfaced through `kinora log` / a future
+    // dedicated command instead.
+    let names: Vec<String> = kinora::roots::root_names(kin_root)
+        .map_err(|e| CliError::Io(std::io::Error::other(e.to_string())))?
+        .into_iter()
+        .filter(|name| name != "commits")
+        .collect();
 
     let store = ContentStore::new(kin_root);
     for root_name in names {
-        let Some(hash) = read_root_pointer(kin_root, &root_name)? else {
-            continue;
-        };
-        let bytes = store.read(&hash).map_err(CliError::Store)?;
-        let kinograph = RootKinograph::parse(&bytes).map_err(CliError::Root)?;
-        for kino in kinograph.entries {
-            owners.insert(kino.id, root_name.clone());
+        // Every head: concurrent commits leave several until the next one
+        // folds them.
+        for hash in read_root_heads(kin_root, &root_name)? {
+            let bytes = store.read(&hash).map_err(CliError::Store)?;
+            let kinograph = RootKinograph::parse(&bytes).map_err(CliError::Root)?;
+            for kino in kinograph.entries {
+                owners.insert(kino.id, root_name.clone());
+            }
         }
     }
     Ok(owners)
