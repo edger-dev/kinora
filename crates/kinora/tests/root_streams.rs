@@ -602,3 +602,81 @@ fn an_assign_only_move_carries_the_kino() {
     assert!(!ids("inbox").contains(&doc.event.id), "moved out");
     assert_eq!(resolves(&a, "doc"), "settled");
 }
+
+/// An assign-only move whose entry cannot be taken — the kino is disputed in
+/// its root — refuses the target root, and the assign stays staged for the
+/// next try.
+#[test]
+fn a_move_that_cannot_be_adopted_refuses_and_keeps_the_assign() {
+    let (_t, a) = repo();
+    let cfg = kinora::paths::config_path(&a);
+    let mut config =
+        kinora::config::Config::from_styx(&fs::read_to_string(&cfg).unwrap()).unwrap();
+    config
+        .roots
+        .insert("main".into(), kinora::config::RootPolicy::Never);
+    fs::write(&cfg, config.to_styx().unwrap()).unwrap();
+    let doc = store(&a, "v1", "doc", None, &[]);
+    commit(&a).unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let b = branch(&a, other.path());
+    store(&a, "v2 left", "doc", Some(&doc), &[&doc]);
+    commit(&a).unwrap();
+    store(&b, "v2 right", "doc", Some(&doc), &[&doc]);
+    commit(&b).unwrap();
+    merge(&b, &a);
+    // Drop the revisions' staged events: the kino lives only in the heads.
+    fs::remove_dir_all(a.join("staged")).unwrap();
+    fs::create_dir_all(a.join("staged")).unwrap();
+
+    let (assign, _) = kinora::assign::write_assign(
+        &a,
+        &kinora::assign::AssignEvent {
+            kino_id: doc.event.id.clone(),
+            target_root: "main".into(),
+            supersedes: vec![],
+            author: "t".into(),
+            ts: "2026-10-24T00:00:03Z".into(),
+            provenance: "test".into(),
+        },
+    )
+    .unwrap();
+    let results = commit_all(
+        &a,
+        CommitParams {
+            author: "t".into(),
+            provenance: "test".into(),
+            ts: "2026-10-24T00:00:04Z".into(),
+        },
+    )
+    .unwrap();
+    let main = results.iter().find(|(name, _)| name == "main").unwrap();
+    let err = main.1.as_ref().err().expect("main refuses").to_string();
+    assert!(err.contains(&doc.event.id), "{err}");
+    assert!(
+        kinora::paths::staged_event_path(&a, &assign).is_file(),
+        "the assign stays staged"
+    );
+}
+
+/// A clone of a forked root whose history has a gap still clones its heads,
+/// and says the history is incomplete.
+#[test]
+fn a_clone_of_a_forked_root_with_a_gap_keeps_its_heads() {
+    let (_t, _o, a, base) = forked_heads();
+    fs::remove_file(blob_path(&a, &base)).unwrap();
+    let target = tempfile::tempdir().unwrap();
+    let dst = target.path().join(".kinora");
+    let report = clone_repo(
+        &a,
+        &dst,
+        CloneParams {
+            author: "t".into(),
+            provenance: "test".into(),
+            ts: "2026-10-24T00:00:02Z".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(root_heads(&dst, "inbox").unwrap().len(), 2);
+    assert_eq!(report.incomplete_histories, vec!["inbox".to_owned()]);
+}

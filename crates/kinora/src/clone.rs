@@ -99,6 +99,10 @@ pub struct CloneReport {
     /// stem-matching filename in src (e.g. legacy extensionless blobs
     /// written before kinora-wpup getting a `<hash>.<ext>` name in dst).
     pub filenames_rewritten: usize,
+    /// Forked roots whose history back to their heads' base is incomplete
+    /// in src: their heads are cloned, the history is not, and their next
+    /// fold refuses until the missing versions are fetched.
+    pub incomplete_histories: Vec<String>,
 }
 
 /// Rebuild `src` into `dst`.
