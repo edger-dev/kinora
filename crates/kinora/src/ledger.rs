@@ -151,13 +151,34 @@ mod tests {
     }
 
     #[test]
-    fn write_event_file_contains_exactly_one_line() {
+    fn write_event_file_holds_exactly_its_line() {
         let (_t, l) = ledger();
         let e = event("staged-one-line", "2026-04-19T09:00:00Z");
         let (h, _) = l.write_event(&e).unwrap();
         let contents = fs::read_to_string(staged_event_path(l.root(), &h)).unwrap();
-        assert!(contents.ends_with('\n'), "file should end with newline: {contents:?}");
-        assert_eq!(contents.matches('\n').count(), 1, "expected one line: {contents:?}");
+        assert_eq!(contents, e.to_json_line().unwrap(), "no trailing newline");
+        assert_eq!(Hash::of_content(contents.as_bytes()), h, "named by its own bytes");
+    }
+
+    #[test]
+    fn write_event_file_verifies_through_the_place() {
+        use moco_place::{FsPlace, Key, Place};
+        let (_t, l) = ledger();
+        let (h, _) = l.write_event(&event("verified", "2026-04-19T09:00:00Z")).unwrap();
+        let key = Key::new(format!("staged/{}/{}.jsonl", h.shard(), h.as_hex())).unwrap();
+        let place = FsPlace::within(l.root());
+        assert_eq!(place.verify(&key).unwrap(), moco_place::Verified::Intact);
+    }
+
+    #[test]
+    fn an_event_file_with_a_trailing_newline_still_reads() {
+        let (_t, l) = ledger();
+        let e = event("legacy-newline", "2026-04-19T09:00:00Z");
+        let h = e.event_hash().unwrap();
+        let path = staged_event_path(l.root(), &h);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, format!("{}\n", e.to_json_line().unwrap())).unwrap();
+        assert_eq!(l.read_all_events().unwrap(), vec![e]);
     }
 
     #[test]
@@ -262,8 +283,8 @@ mod tests {
         let e = event("tmp-cleanup", "2026-04-19T09:00:00Z");
         let (h, _) = l.write_event(&e).unwrap();
         let shard = staged_dir(l.root()).join(h.shard());
-        let tmp = shard.join(format!("{}.jsonl.tmp", h.as_hex()));
-        assert!(!tmp.exists(), "orphan tmp left behind: {}", tmp.display());
+        let left: Vec<_> = fs::read_dir(&shard).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(left, vec![std::ffi::OsString::from(format!("{}.jsonl", h.as_hex()))], "only the event file");
     }
 
     #[test]

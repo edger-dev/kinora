@@ -448,3 +448,157 @@ fn revisions_folded_into_one_commit_are_not_a_fork() {
     commit(&a).unwrap();
     assert_eq!(resolves(&a, "doc"), "v3");
 }
+
+/// The content-store file of `hash`, whatever its extension.
+fn blob_path(root: &Path, hash: &kinora::hash::Hash) -> PathBuf {
+    fs::read_dir(root.join("store").join(hash.shard()))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.to_string_lossy().contains(hash.as_hex()))
+        .unwrap()
+}
+
+/// Two branches off one commit, merged: two heads whose base is that commit.
+fn forked_heads() -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    PathBuf,
+    kinora::hash::Hash,
+) {
+    let (t, a) = repo();
+    store(&a, "base", "base", None, &[]);
+    commit(&a).unwrap();
+    let base = root_heads(&a, "inbox").unwrap()[0].clone();
+    let other = tempfile::tempdir().unwrap();
+    let b = branch(&a, other.path());
+    store(&a, "from a", "left", None, &[]);
+    commit(&a).unwrap();
+    store(&b, "from b", "right", None, &[]);
+    commit(&b).unwrap();
+    merge(&b, &a);
+    (t, other, a, base)
+}
+
+/// The base version gone from the store: the fold cannot tell what each
+/// head dropped, so the commit and a read of the root refuse, naming it.
+#[test]
+fn a_fold_over_a_missing_version_refuses() {
+    let (_t, _o, a, base) = forked_heads();
+    fs::remove_file(blob_path(&a, &base)).unwrap();
+    let err = commit(&a).unwrap_err();
+    assert!(err.contains(base.as_hex()), "{err}");
+    let err = Resolver::load(&a)
+        .err()
+        .expect("a read refuses too")
+        .to_string();
+    assert!(err.contains(base.as_hex()), "{err}");
+}
+
+/// A version older than the base is not needed: the fold goes ahead.
+#[test]
+fn a_missing_version_below_the_base_does_not_matter() {
+    let (t, a) = repo();
+    store(&a, "first", "first", None, &[]);
+    commit(&a).unwrap();
+    let genesis = root_heads(&a, "inbox").unwrap()[0].clone();
+    store(&a, "base", "base", None, &[]);
+    commit(&a).unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let b = branch(&a, other.path());
+    store(&a, "from a", "left", None, &[]);
+    commit(&a).unwrap();
+    store(&b, "from b", "right", None, &[]);
+    commit(&b).unwrap();
+    merge(&b, &a);
+    fs::remove_file(blob_path(&a, &genesis)).unwrap();
+    commit(&a).unwrap();
+    assert_eq!(root_heads(&a, "inbox").unwrap().len(), 1);
+    assert_eq!(resolves(&a, "left"), "from a");
+    assert_eq!(resolves(&a, "right"), "from b");
+    drop(t);
+}
+
+/// A long linear history under two heads: the walk reads it once, and
+/// finds the base in one pass.
+#[test]
+fn a_long_history_walks_quickly() {
+    use kinora::root::RootKinograph;
+    use kinora::roots::RootHistory;
+    use kinora::store::ContentStore;
+
+    let (_t, a) = repo();
+    let store = ContentStore::new(&a);
+    let put = |kg: &RootKinograph| {
+        store
+            .write("root", kg.to_styxl().unwrap().as_bytes())
+            .unwrap()
+    };
+    let genesis =
+        RootKinograph::new_genesis(vec![], "t0".into(), "t".into(), "test".into()).unwrap();
+    let lineage = genesis.header.id.clone();
+    let mut tip = put(&genesis);
+    let child = |parents: Vec<String>, ts: String| {
+        RootKinograph::new_child(
+            lineage.clone(),
+            parents,
+            vec![],
+            ts,
+            "t".into(),
+            "test".into(),
+        )
+    };
+    for n in 0..600 {
+        tip = put(&child(vec![tip.as_hex().to_owned()], format!("t{n:04}")));
+    }
+    let left = put(&child(vec![tip.as_hex().to_owned()], "left".into()));
+    let right = put(&child(vec![tip.as_hex().to_owned()], "right".into()));
+
+    let started = std::time::Instant::now();
+    let history = RootHistory::walk(&a, &[left, right]).unwrap();
+    let took = started.elapsed();
+    assert_eq!(history.base.unwrap().header.ts, "t0599");
+    assert_eq!(history.walked.len(), 3, "the heads and the base");
+    assert!(took < std::time::Duration::from_secs(2), "took {took:?}");
+}
+
+/// A committed kino moved with an assign alone (its events drained): it
+/// lands in the target root and leaves the old one.
+#[test]
+fn an_assign_only_move_carries_the_kino() {
+    let (_t, a) = repo();
+    let cfg = kinora::paths::config_path(&a);
+    let mut config = kinora::config::Config::from_styx(&fs::read_to_string(&cfg).unwrap()).unwrap();
+    config
+        .roots
+        .insert("main".into(), kinora::config::RootPolicy::Never);
+    fs::write(&cfg, config.to_styx().unwrap()).unwrap();
+    let doc = store(&a, "settled", "doc", None, &[]);
+    commit(&a).unwrap();
+
+    kinora::assign::write_assign(
+        &a,
+        &kinora::assign::AssignEvent {
+            kino_id: doc.event.id.clone(),
+            target_root: "main".into(),
+            supersedes: vec![],
+            author: "t".into(),
+            ts: "2026-10-24T00:00:03Z".into(),
+            provenance: "test".into(),
+        },
+    )
+    .unwrap();
+    commit_at(&a, "2026-10-24T00:00:04Z", "t").unwrap();
+
+    let ids = |root: &str| -> Vec<String> {
+        let mut ids = Vec::new();
+        for head in root_heads(&a, root).unwrap() {
+            let bytes = kinora::store::ContentStore::new(&a).read(&head).unwrap();
+            let kg = kinora::root::RootKinograph::parse(&bytes).unwrap();
+            ids.extend(kg.entries.into_iter().map(|e| e.id));
+        }
+        ids
+    };
+    assert!(ids("main").contains(&doc.event.id), "moved in");
+    assert!(!ids("inbox").contains(&doc.event.id), "moved out");
+    assert_eq!(resolves(&a, "doc"), "settled");
+}
