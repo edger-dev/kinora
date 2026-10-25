@@ -47,6 +47,12 @@ pub enum RootsError {
     InvalidPointer { path: PathBuf, body: String },
     #[error("root {name:?} cannot be a stream name: {reason}")]
     InvalidName { name: String, reason: String },
+    #[error(
+        "the root's history is incomplete: version(s) {} missing from the content store; \
+         fetch them before folding",
+        .versions.join(", ")
+    )]
+    MissingVersions { versions: Vec<String> },
 }
 
 /// Every root with committed versions, sorted: streams and legacy pointers
@@ -193,16 +199,23 @@ pub struct RootHistory {
     pub base: Option<RootKinograph>,
     /// The root versions from each head back to the base, inclusive.
     pub walked: Vec<RootKinograph>,
+    /// Their hashes, and the base's: what a fold of these heads reads.
+    pub versions: Vec<Hash>,
     /// Kino version → its parents.
     ancestry: HashMap<String, Vec<String>>,
 }
 
 impl RootHistory {
-    /// Walk the history of `heads` through the content store. A version
-    /// missing from the store ends its branch of the walk.
+    /// Walk the history of `heads` through the content store: each version's
+    /// header once, the base found in one pass, and only the versions above
+    /// it (and the base) read whole. A version missing from the store that
+    /// is not older than the base refuses the walk — the fold would guess.
+    // implements: 02be1c37832e1c710030e7bc5a89441b55bdbf5a05ebe2c501f824708b7f3372@3749549c4b20f9d3a5c66efb4f1aec204936a371ec7fc46226a5b8bc41ec70bc
     pub fn walk(kinora_root: &Path, heads: &[Hash]) -> Result<Self, RootsError> {
         let store = ContentStore::new(kinora_root);
-        let mut versions: HashMap<String, RootKinograph> = HashMap::new();
+        // Version → its parents, from its header; a missing one has none.
+        let mut parents: HashMap<String, Vec<String>> = HashMap::new();
+        let mut missing: BTreeSet<String> = BTreeSet::new();
         let mut ancestors_of: Vec<HashSet<String>> = Vec::new();
         for head in heads {
             let mut seen = HashSet::new();
@@ -211,27 +224,40 @@ impl RootHistory {
                 if !seen.insert(hex.clone()) {
                     continue;
                 }
-                let kg = match versions.get(&hex) {
-                    Some(kg) => kg.clone(),
-                    None => {
-                        let Ok(hash) = Hash::from_str(&hex) else {
-                            continue;
-                        };
-                        let Ok(bytes) = store.read(&hash) else {
-                            continue;
-                        };
-                        let kg = RootKinograph::parse(&bytes)?;
-                        versions.insert(hex.clone(), kg.clone());
-                        kg
-                    }
-                };
-                queue.extend(kg.header.parents.iter().cloned());
+                if !parents.contains_key(&hex) {
+                    let read = Hash::from_str(&hex).ok().and_then(|h| store.read(&h).ok());
+                    let found = match read {
+                        Some(bytes) => parents_of(&bytes)
+                            .iter()
+                            .map(|p| p.as_hex().to_owned())
+                            .collect(),
+                        None => {
+                            missing.insert(hex.clone());
+                            Vec::new()
+                        }
+                    };
+                    parents.insert(hex.clone(), found);
+                }
+                queue.extend(parents[&hex].iter().cloned());
             }
             ancestors_of.push(seen);
         }
+        // Everything strictly older than any of `from`.
+        let below = |from: &mut dyn Iterator<Item = &String>| -> HashSet<String> {
+            let mut seen = HashSet::new();
+            let mut queue: Vec<String> = from
+                .flat_map(|v| parents.get(v).into_iter().flatten().cloned())
+                .collect();
+            while let Some(hex) = queue.pop() {
+                if seen.insert(hex.clone()) {
+                    queue.extend(parents.get(&hex).into_iter().flatten().cloned());
+                }
+            }
+            seen
+        };
         // The common ancestors, and among them the latest: one no other
         // common ancestor descends from. Ties go to the smallest hash.
-        let mut common: Vec<String> = ancestors_of
+        let common: BTreeSet<String> = ancestors_of
             .first()
             .map(|first| {
                 first
@@ -241,45 +267,48 @@ impl RootHistory {
                     .collect()
             })
             .unwrap_or_default();
-        common.sort();
-        let below = |v: &str| -> HashSet<String> {
-            let mut seen = HashSet::new();
-            let mut queue: Vec<String> = versions
-                .get(v)
-                .map(|kg| kg.header.parents.clone())
-                .unwrap_or_default();
-            while let Some(hex) = queue.pop() {
-                if seen.insert(hex.clone())
-                    && let Some(kg) = versions.get(&hex)
-                {
-                    queue.extend(kg.header.parents.iter().cloned());
-                }
-            }
-            seen
-        };
+        let older_than_common = below(&mut common.iter());
         let base_hex = common
             .iter()
-            .find(|c| !common.iter().any(|d| d != *c && below(d).contains(*c)))
+            .find(|c| !older_than_common.contains(*c))
             .cloned();
-        let older = base_hex.as_deref().map(below).unwrap_or_default();
-        let mut walked_hex: Vec<String> = ancestors_of
+        let older = below(&mut base_hex.iter());
+        let gaps: Vec<String> = missing
+            .into_iter()
+            .filter(|v| !older.contains(v))
+            .collect();
+        if !gaps.is_empty() {
+            return Err(RootsError::MissingVersions { versions: gaps });
+        }
+        let read = |hex: &str| -> Result<RootKinograph, RootsError> {
+            let hash = Hash::from_str(hex).map_err(|_| RootsError::MissingVersions {
+                versions: vec![hex.to_owned()],
+            })?;
+            Ok(RootKinograph::parse(&store.read(&hash)?)?)
+        };
+        let walked_hex: BTreeSet<&String> = ancestors_of
             .iter()
             .flatten()
             .filter(|v| !older.contains(*v))
-            .cloned()
+            .collect();
+        let walked = walked_hex
+            .iter()
+            .map(|v| read(v))
+            .collect::<Result<Vec<_>, _>>()?;
+        let base = base_hex.as_deref().map(read).transpose()?;
+        let versions = walked_hex
+            .into_iter()
+            .chain(base_hex.as_ref())
+            .filter_map(|v| Hash::from_str(v).ok())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        walked_hex.retain(|v| versions.contains_key(v));
         let mut history = Self {
-            base: base_hex.and_then(|b| versions.get(&b).cloned()),
-            walked: walked_hex
-                .iter()
-                .filter_map(|v| versions.get(v).cloned())
-                .collect(),
+            base,
+            walked: Vec::new(),
+            versions,
             ancestry: HashMap::new(),
         };
-        let walked = std::mem::take(&mut history.walked);
         for kg in &walked {
             for entry in &kg.entries {
                 history.add(&entry.version, &entry.parents);

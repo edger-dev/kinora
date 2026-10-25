@@ -1,11 +1,13 @@
 use std::collections::HashSet;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader};
+
+use moco_place::{put_bytes, FsPlace, Key, Put};
 use std::path::{Path, PathBuf};
 
 use crate::event::{Event, EventError};
 use crate::hash::Hash;
-use crate::paths::{staged_dir, staged_event_path, STAGED_EXT};
+use crate::paths::{staged_dir, staged_event_path, STAGED_DIR, STAGED_EXT};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LedgerError {
@@ -13,6 +15,8 @@ pub enum LedgerError {
     Io(#[from] io::Error),
     #[error("ledger event error: {0}")]
     Event(#[from] EventError),
+    #[error("ledger place error: {0}")]
+    Place(#[from] moco_place::PlaceError),
 }
 
 pub struct Ledger {
@@ -33,15 +37,17 @@ impl Ledger {
         Ok(())
     }
 
-    /// Write `event` to `.kinora/staged/<ab>/<event-hash>.jsonl`. Crash-atomic
-    /// via tmp+rename: a crash mid-write leaves an orphan tmp but never a
-    /// truncated target, so a follow-up call always sees either a complete
-    /// file or no file at all. Idempotent: if the target already exists
-    /// (event hash is content-addressed, so identical path implies identical
+    /// Write `event` to `.kinora/staged/<ab>/<event-hash>.jsonl`. The file
+    /// holds exactly the canonical line, no trailing newline, so it is named
+    /// by the hash of its own bytes and verifies through a place. Written
+    /// through the ledger's place (moco's put-once), so a crash leaves no
+    /// truncated target. Idempotent: if the target already exists (event
+    /// hash is content-addressed, so identical path implies identical
     /// content), returns the hash without rewriting.
     ///
     /// Returns `(event_hash, was_new)` — `was_new` is true iff the target
     /// file did not exist before this call.
+    // implements: b0e9efc88034231698e376e4ffd496b437792b47b627c97cc498b99a589ba708@6f49c18e7238bdead174aeaac60d2d5ca9caef198dfc94494c623fa042269454
     pub fn write_event(&self, event: &Event) -> Result<(Hash, bool), LedgerError> {
         self.ensure_layout()?;
         let line = event.to_json_line()?;
@@ -50,17 +56,14 @@ impl Ledger {
         if path.is_file() {
             return Ok((event_hash, false));
         }
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let tmp = path.with_extension(format!("{STAGED_EXT}.tmp"));
-        {
-            let mut f = fs::File::create(&tmp)?;
-            f.write_all(line.as_bytes())?;
-            f.write_all(b"\n")?;
-        }
-        fs::rename(&tmp, &path)?;
-        Ok((event_hash, true))
+        let key = Key::new(format!(
+            "{STAGED_DIR}/{}/{}.{STAGED_EXT}",
+            event_hash.shard(),
+            event_hash.as_hex()
+        ))
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let put = put_bytes(&FsPlace::within(&self.kinora_root), &key, line.as_bytes())?;
+        Ok((event_hash, put == Put::Stored))
     }
 
     /// Return every event stored under `.kinora/staged/`, deduped by event hash.

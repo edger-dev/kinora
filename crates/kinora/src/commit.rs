@@ -17,6 +17,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
 use std::io;
@@ -575,10 +576,22 @@ fn route_kino(
     }
 }
 
-/// Build the kino-id -> owning-root map from every declared root's prior
-/// committed kinograph. Used so an unassigned revision inherits its current
-/// root (see [`route_kino`]). Roots are visited in sorted name order so a
-/// (rare, pre-phase-3) duplicate id resolves deterministically (last wins).
+/// Which root holds each committed kino, and its entry there, as the prior
+/// committed roots stand: a batch-start snapshot, so a root committed
+/// earlier in a batch does not change what the later ones see.
+struct Ownership {
+    /// Kino id → its owning root. Lets an unassigned revision inherit its
+    /// current root (see [`route_kino`]).
+    roots: BTreeMap<String, String>,
+    /// Kino id → its entry in that root. Lets a kino moved by an assign
+    /// alone, its store events drained, carry its entry to the new root.
+    entries: BTreeMap<String, RootEntry>,
+}
+
+/// Build the [`Ownership`] snapshot from every declared root's prior
+/// committed kinograph — several heads folded, a disputed kino left out of
+/// `entries`. Roots are visited in sorted name order so a (rare,
+/// pre-phase-3) duplicate id resolves deterministically (last wins).
 ///
 /// Missing pointers and unreadable/unparseable blobs are skipped rather than
 /// failing the commit — a broken sibling root shouldn't strand routing for
@@ -587,20 +600,80 @@ fn route_kino(
 fn collect_root_ownership(
     kinora_root: &Path,
     declared_roots: &BTreeSet<String>,
-) -> Result<BTreeMap<String, String>, CommitError> {
+) -> Result<Ownership, CommitError> {
     let store = ContentStore::new(kinora_root);
-    let mut owned: BTreeMap<String, String> = BTreeMap::new();
+    let mut owned = Ownership {
+        roots: BTreeMap::new(),
+        entries: BTreeMap::new(),
+    };
     // BTreeSet already yields sorted names; iterate explicitly for clarity.
     for root_name in declared_roots {
-        for hash in read_root_heads(kinora_root, root_name)? {
-            let Ok(bytes) = store.read(&hash) else { continue };
+        let heads = read_root_heads(kinora_root, root_name)?;
+        let mut priors = Vec::with_capacity(heads.len());
+        for hash in &heads {
+            let Ok(bytes) = store.read(hash) else { continue };
             let Ok(kg) = RootKinograph::parse(&bytes) else { continue };
+            priors.push(kg);
+        }
+        for kg in &priors {
+            for entry in &kg.entries {
+                owned.roots.insert(entry.id.clone(), root_name.clone());
+            }
+        }
+        let folded = match priors.len() {
+            0 => continue,
+            1 => priors.pop().map(|kg| (kg, BTreeMap::new())),
+            _ => RootHistory::walk(kinora_root, &heads)
+                .ok()
+                .and_then(|history| match fold_heads(&priors, &history) {
+                    (Some(kg), disputed) => Some((kg, disputed)),
+                    (None, _) => None,
+                }),
+        };
+        if let Some((kg, disputed)) = folded {
             for entry in kg.entries {
-                owned.insert(entry.id, root_name.clone());
+                if !disputed.contains_key(&entry.id) {
+                    owned.entries.insert(entry.id.clone(), entry);
+                }
             }
         }
     }
     Ok(owned)
+}
+
+/// A kino assigned to `root_name` that the fresh build lacks — moved by an
+/// assign alone, its store events drained — takes its committed entry
+/// from the ownership snapshot.
+// implements: 02be1c37832e1c710030e7bc5a89441b55bdbf5a05ebe2c501f824708b7f3372@3749549c4b20f9d3a5c66efb4f1aec204936a371ec7fc46226a5b8bc41ec70bc
+fn adopt_assigned_entries(
+    root: &mut RootKinograph,
+    root_name: &str,
+    events: &[Event],
+    declared_roots: &BTreeSet<String>,
+    owned: &Ownership,
+) -> Result<(), CommitError> {
+    let live_assigns = collect_live_assigns(events)?;
+    let mut adopted = false;
+    for (_, assign) in &live_assigns {
+        if assign.target_root != root_name
+            || root.entries.iter().any(|e| e.id == assign.kino_id)
+        {
+            continue;
+        }
+        if kino_target_root(&assign.kino_id, &live_assigns, declared_roots)?.as_deref()
+            != Some(root_name)
+        {
+            continue;
+        }
+        if let Some(entry) = owned.entries.get(&assign.kino_id) {
+            root.entries.push(entry.clone());
+            adopted = true;
+        }
+    }
+    if adopted {
+        root.entries.sort_by(|a, b| a.id.cmp(&b.id));
+    }
+    Ok(())
 }
 
 fn pick_head<'a>(id: &str, events: &[&'a Event]) -> Result<&'a Event, CommitError> {
@@ -675,7 +748,7 @@ fn commit_root_with_refs(
     config: &Config,
     declared_roots: &BTreeSet<String>,
     events: &[Event],
-    owned: &BTreeMap<String, String>,
+    owned: &Ownership,
     refs: &ExternalRefs,
 ) -> Result<CommitResult, CommitError> {
     validate_root_name(root_name)?;
@@ -725,7 +798,8 @@ fn commit_root_with_refs(
     let merge_source = matches!(policy, RootPolicy::Never | RootPolicy::MaxAge(_))
         .then_some(prior_root.as_ref())
         .flatten();
-    let mut root = build_root(events, root_name, declared_roots, owned, merge_source)?;
+    let mut root = build_root(events, root_name, declared_roots, &owned.roots, merge_source)?;
+    adopt_assigned_entries(&mut root, root_name, events, declared_roots, owned)?;
     propagate_pins(&mut root, prior_root.as_ref());
 
     // A disputed kino is settled only when the fresh build carries a version
@@ -855,7 +929,7 @@ fn commit_root_with_refs(
             root_name,
             events,
             declared_roots,
-            owned,
+            &owned.roots,
             &params,
         )?
         && matches!(policy, RootPolicy::Never | RootPolicy::MaxAge(_))
@@ -877,7 +951,7 @@ fn commit_root_with_refs(
         && matches!(policy, RootPolicy::Never | RootPolicy::MaxAge(_))
     {
         let owned_events =
-            collect_owned_staged_events(events, root_name, declared_roots, owned)?;
+            collect_owned_staged_events(events, root_name, declared_roots, &owned.roots)?;
         let owned_hashes: Vec<Hash> = owned_events
             .iter()
             .map(|e| e.event_hash())
@@ -893,7 +967,7 @@ fn commit_root_with_refs(
         events,
         root_name,
         declared_roots,
-        owned,
+        &owned.roots,
         &root,
         &policy,
         &implicit_pinned,
@@ -913,14 +987,16 @@ fn collect_owned_staged_events<'e>(
     owned_roots: &BTreeMap<String, String>,
 ) -> Result<Vec<&'e Event>, CommitError> {
     let live_assigns = collect_live_assigns(events)?;
+    let assign_owners = assign_owners(events)?;
     let mut owned: Vec<&Event> = Vec::new();
     for e in events {
         if e.event_kind == EVENT_KIND_ASSIGN {
-            // `collect_live_assigns` above already parsed every assign,
-            // so any malformed one would have surfaced there — match its
-            // `?` style instead of silently dropping.
-            let a = AssignEvent::from_event(e)?;
-            if a.target_root == root_name {
+            // `assign_owners` above already parsed every assign, so any
+            // malformed one would have surfaced there.
+            if assign_owners
+                .get(e.event_hash()?.as_hex())
+                .is_some_and(|roots| roots.contains(root_name))
+            {
                 owned.push(e);
             }
             continue;
@@ -936,6 +1012,52 @@ fn collect_owned_staged_events<'e>(
         }
     }
     Ok(owned)
+}
+
+/// Assign event hash → the roots that own it: a live assign's own target;
+/// a superseded assign's, those of the live assigns that superseded it
+/// (transitively). So the root that commits a move also drains the assigns
+/// the move replaced — left behind, a superseded assign would turn live again
+/// once its superseder drained.
+fn assign_owners(events: &[Event]) -> Result<HashMap<String, BTreeSet<String>>, CommitError> {
+    let mut targets: HashMap<String, String> = HashMap::new();
+    let mut superseded_by: HashMap<String, Vec<String>> = HashMap::new();
+    for e in events {
+        if e.event_kind != EVENT_KIND_ASSIGN {
+            continue;
+        }
+        let hash = e.event_hash()?.as_hex().to_owned();
+        let a = AssignEvent::from_event(e)?;
+        for s in &a.supersedes {
+            superseded_by.entry(s.clone()).or_default().push(hash.clone());
+        }
+        targets.insert(hash, a.target_root);
+    }
+    let mut owners = HashMap::new();
+    for hash in targets.keys() {
+        let mut roots = BTreeSet::new();
+        let mut seen = HashSet::new();
+        let mut queue = vec![hash.clone()];
+        while let Some(h) = queue.pop() {
+            if !seen.insert(h.clone()) {
+                continue;
+            }
+            match superseded_by.get(&h) {
+                Some(by) => queue.extend(by.iter().cloned()),
+                None => {
+                    if let Some(t) = targets.get(&h) {
+                        roots.insert(t.clone());
+                    }
+                }
+            }
+        }
+        if roots.is_empty() {
+            // A supersession cycle: nothing is live; its own target keeps it.
+            roots.extend(targets.get(hash).cloned());
+        }
+        owners.insert(hash.clone(), roots);
+    }
+    Ok(owners)
 }
 
 /// Archive the staged events owned by `root_name` into a `commit-archive`

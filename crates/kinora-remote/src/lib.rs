@@ -430,7 +430,8 @@ fn stem_hash(rel: &str) -> Option<Hash> {
 }
 
 /// Whether a mirrored file is what its name says: a blob's bytes hash to it;
-/// an event is one canonical event line (plus its newline) that hashes to it.
+/// an event is one canonical event line that hashes to it — written alone,
+/// or (by kinora before events held exactly their line) with a newline.
 fn content_matches(rel: &str, bytes: &[u8]) -> bool {
     let Some(name) = stem_hash(rel) else {
         return false;
@@ -438,9 +439,7 @@ fn content_matches(rel: &str, bytes: &[u8]) -> bool {
     if rel.starts_with("store/") {
         return Hash::of_content(bytes) == name;
     }
-    let Some(line) = bytes.strip_suffix(b"\n") else {
-        return false;
-    };
+    let line = bytes.strip_suffix(b"\n").unwrap_or(bytes);
     if line.contains(&b'\n') || Hash::of_content(line) != name {
         return false;
     }

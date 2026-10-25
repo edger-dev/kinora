@@ -12,7 +12,8 @@
 //!
 //! Reachability walk:
 //!
-//! 1. Every declared root's pointer → root-blob hash reachable.
+//! 1. Every declared root's heads → root-blob hashes reachable; a root with
+//!    several heads also carries its history back to their common base.
 //! 2. Parse the root blob; each `RootEntry`'s `version` hash reachable.
 //! 3. For entries of kind `kinograph`, recurse via staged events' head
 //!    (same `pick_head` rule as `reformat`) into composition-entry ids.
@@ -28,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use crate::commit::{read_root_heads, CommitError};
-use crate::roots::{append_root_version, RootsError};
+use crate::roots::{append_root_version, RootHistory, RootsError};
 use crate::config::{Config, ConfigError};
 use crate::event::{Event, EventError};
 use crate::hash::{Hash, HashParseError};
@@ -143,6 +144,24 @@ pub fn clone_repo(
         for head in read_root_heads(src, root_name)? {
             heads.push((root_name.clone(), head));
         }
+    }
+    // A forked root's history back to its heads' base: the next commit in
+    // the clone folds against it.
+    let mut root_versions: Vec<Hash> = heads.iter().map(|(_, h)| h.clone()).collect();
+    for root_name in config.roots.keys() {
+        let forked: Vec<Hash> = heads
+            .iter()
+            .filter(|(name, _)| name == root_name)
+            .map(|(_, h)| h.clone())
+            .collect();
+        if forked.len() > 1 {
+            root_versions.extend(RootHistory::walk(src, &forked)?.versions);
+        }
+    }
+    for hash in &root_versions {
+        let hex = hash.as_hex().to_owned();
+        reachable_blobs.insert(hex.clone());
+        reachable_kinds.insert(hex, "root".to_owned());
     }
     for (_, root_hash) in &heads {
         let root_hash = root_hash.clone();
