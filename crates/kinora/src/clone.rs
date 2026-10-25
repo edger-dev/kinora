@@ -152,6 +152,7 @@ pub fn clone_repo(
     // A forked root's history back to its heads' base: the next commit in
     // the clone folds against it.
     let mut root_versions: Vec<Hash> = heads.iter().map(|(_, h)| h.clone()).collect();
+    let mut incomplete_histories = Vec::new();
     for root_name in config.roots.keys() {
         let forked: Vec<Hash> = heads
             .iter()
@@ -159,7 +160,15 @@ pub fn clone_repo(
             .map(|(_, h)| h.clone())
             .collect();
         if forked.len() > 1 {
-            root_versions.extend(RootHistory::walk(src, &forked)?.versions);
+            match RootHistory::walk(src, &forked) {
+                Ok(history) => root_versions.extend(history.versions),
+                // Heads only: the gap travels, and the clone's next fold
+                // refuses just as src's would.
+                Err(RootsError::MissingVersions { .. }) => {
+                    incomplete_histories.push(root_name.clone());
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
     }
     for hash in &root_versions {
@@ -224,7 +233,10 @@ pub fn clone_repo(
     }
 
     let src_blobs = enumerate_blobs(src)?;
-    let mut report = CloneReport::default();
+    let mut report = CloneReport {
+        incomplete_histories,
+        ..CloneReport::default()
+    };
 
     for hex in &reachable_blobs {
         let hash = Hash::from_str(hex).map_err(|err| CloneError::InvalidHash {

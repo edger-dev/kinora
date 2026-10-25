@@ -651,7 +651,7 @@ fn a_move_that_cannot_be_adopted_refuses_and_keeps_the_assign() {
     )
     .unwrap();
     let main = results.iter().find(|(name, _)| name == "main").unwrap();
-    let err = main.1.as_ref().err().expect("main refuses").to_string();
+    let err = main.1.as_ref().expect_err("main refuses").to_string();
     assert!(err.contains(&doc.event.id), "{err}");
     assert!(
         kinora::paths::staged_event_path(&a, &assign).is_file(),

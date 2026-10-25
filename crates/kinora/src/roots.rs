@@ -23,7 +23,7 @@ use std::str::FromStr;
 use moco_place::{FsPlace, Key, Stream, read_all};
 
 use crate::hash::Hash;
-use crate::paths::{root_pointer_path, roots_dir};
+use crate::paths::{find_blob_path, root_pointer_path, roots_dir};
 use crate::root::{RootEntry, RootKinograph};
 use crate::store::{ContentStore, StoreError};
 
@@ -225,12 +225,15 @@ impl RootHistory {
                     continue;
                 }
                 if !parents.contains_key(&hex) {
-                    let read = Hash::from_str(&hex).ok().and_then(|h| store.read(&h).ok());
-                    let found = match read {
-                        Some(bytes) => parents_of(&bytes)
-                            .iter()
-                            .map(|p| p.as_hex().to_owned())
-                            .collect(),
+                    // The header alone; versions the fold uses are read
+                    // whole (and checked) below. A corrupt header counts as
+                    // missing: its parents are unknown.
+                    let found = Hash::from_str(&hex)
+                        .ok()
+                        .and_then(|h| read_header(kinora_root, &h))
+                        .and_then(|line| header_parents(&line));
+                    let found = match found {
+                        Some(ps) => ps.iter().map(|p| p.as_hex().to_owned()).collect(),
                         None => {
                             missing.insert(hex.clone());
                             Vec::new()
@@ -551,18 +554,28 @@ fn read_pointer(path: &Path) -> Result<Hash, RootsError> {
 /// A root version's parents, from its header line alone; none if it does
 /// not parse (a corrupt entry stays a head, for a human to see).
 fn parents_of(bytes: &[u8]) -> Vec<Hash> {
+    header_parents(bytes).unwrap_or_default()
+}
+
+/// A root version's parents from its header line; `None` when the header
+/// does not parse or names a parent that is not a hash.
+fn header_parents(bytes: &[u8]) -> Option<Vec<Hash>> {
     let header = bytes.split(|b| *b == b'\n').next().unwrap_or_default();
     let mut line = header.to_vec();
     line.push(b'\n');
-    RootKinograph::parse(&line)
-        .map(|kg| {
-            kg.header
-                .parents
-                .iter()
-                .filter_map(|p| p.parse().ok())
-                .collect()
-        })
-        .unwrap_or_default()
+    let kg = RootKinograph::parse(&line).ok()?;
+    kg.header.parents.iter().map(|p| p.parse().ok()).collect()
+}
+
+/// The first line of a stored version, read without the rest of the file.
+fn read_header(kinora_root: &Path, hash: &Hash) -> Option<Vec<u8>> {
+    use std::io::BufRead;
+    let path = find_blob_path(kinora_root, hash)?;
+    let mut line = Vec::new();
+    io::BufReader::new(fs::File::open(path).ok()?)
+        .read_until(b'\n', &mut line)
+        .ok()?;
+    Some(line)
 }
 
 #[cfg(test)]

@@ -80,6 +80,12 @@ pub fn format_clone_summary(r: &CloneRunReport) -> String {
         inner.filenames_rewritten,
         plural_s(inner.filenames_rewritten),
     ));
+    if !inner.incomplete_histories.is_empty() {
+        out.push_str(&format!(
+            "\nincomplete history (heads only; the next commit refuses until fetched): {}",
+            inner.incomplete_histories.join(", "),
+        ));
+    }
     out
 }
 
@@ -209,6 +215,7 @@ mod tests {
                 kinos_rebuilt: 1,
                 blobs_dropped: 1,
                 filenames_rewritten: 1,
+                incomplete_histories: vec![],
             },
             src: PathBuf::from("/a"),
             dst: PathBuf::from("/b"),
@@ -226,6 +233,7 @@ mod tests {
                 kinos_rebuilt: 5,
                 blobs_dropped: 3,
                 filenames_rewritten: 2,
+                incomplete_histories: vec!["inbox".into()],
             },
             src: PathBuf::from("/a"),
             dst: PathBuf::from("/b"),
@@ -233,6 +241,7 @@ mod tests {
         let s = format_clone_summary(&r);
         assert!(s.contains("5 kinos rebuilt"), "got: {s}");
         assert!(s.contains("3 blobs dropped"), "got: {s}");
+        assert!(s.contains("incomplete history (heads only"), "got: {s}");
         assert!(s.contains("2 filenames rewritten"), "got: {s}");
     }
 }

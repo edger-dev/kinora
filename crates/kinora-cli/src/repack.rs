@@ -154,6 +154,7 @@ mod tests {
                     kinos_rebuilt: 1,
                     blobs_dropped: 1,
                     filenames_rewritten: 1,
+                    incomplete_histories: vec![],
                 },
                 orphan_events_drained: 1,
             },

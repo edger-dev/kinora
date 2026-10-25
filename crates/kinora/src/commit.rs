@@ -118,6 +118,12 @@ pub enum CommitError {
         .kinos.iter().map(|(id, versions)| format!("{id} ({})", versions.join(", "))).collect::<Vec<_>>().join("; ")
     )]
     ForkedRoot { root: String, kinos: Vec<(String, Vec<String>)> },
+    /// A kino assigned to `root` with no new version, whose committed entry
+    /// in `from` cannot be read (that root is forked on it, or unreadable).
+    #[error(
+        "kino {kino_id} is assigned to root {root}, but its entry in root {from} cannot be taken (forked or unreadable there): settle {from} and commit again"
+    )]
+    UnadoptedMove { kino_id: String, root: String, from: String },
 }
 
 impl From<RootsError> for CommitError {
@@ -665,9 +671,23 @@ fn adopt_assigned_entries(
         {
             continue;
         }
-        if let Some(entry) = owned.entries.get(&assign.kino_id) {
-            root.entries.push(entry.clone());
-            adopted = true;
+        match owned.entries.get(&assign.kino_id) {
+            Some(entry) => {
+                root.entries.push(entry.clone());
+                adopted = true;
+            }
+            // Committed, but its entry cannot be taken (disputed in its
+            // root, or unreadable): refuse, so the assign is not drained
+            // and the move is not lost.
+            None => {
+                if let Some(from) = owned.roots.get(&assign.kino_id) {
+                    return Err(CommitError::UnadoptedMove {
+                        kino_id: assign.kino_id.clone(),
+                        root: root_name.to_owned(),
+                        from: from.clone(),
+                    });
+                }
+            }
         }
     }
     if adopted {
